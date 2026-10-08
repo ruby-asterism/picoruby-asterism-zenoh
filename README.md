@@ -7,7 +7,7 @@ and watch liveliness. The Ruby name is `Asterism::Zenoh`
 (no top-level constant is defined).
 
 ```ruby
-s = Asterism::Zenoh::Session.open("tcp/192.168.1.10:7447")   # client mode
+s = Asterism::Zenoh::Session.open("tcp/192.0.2.10:7447")   # client mode
 sub = s.subscribe("demo/in")
 loop do
   s.poll                                  # run zenoh-pico's pending work
