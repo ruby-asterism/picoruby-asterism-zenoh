@@ -19,3 +19,14 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+--------------------------------------------------------------------------------
+
+Files not under the MIT License above: the following files are derived from
+Eclipse zenoh-pico (EPL-2.0 OR Apache-2.0) and are distributed under the
+Apache License, Version 2.0 (LICENSE-APACHE, with the notices in NOTICE):
+
+- src/zp_tcp_posix.c
+- src/zp_network_posix.c
+- ports/esp32/zp_tcp_esp32.c
+- include/zenoh_espidf_platform.h

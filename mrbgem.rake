@@ -21,7 +21,9 @@
 #   They must be compiled with the same defines and include paths; see
 #   README.md (Building).
 MRuby::Gem::Specification.new('picoruby-asterism-zenoh') do |spec|
-  spec.license = 'MIT'
+  # MIT for the gem's own code; Apache-2.0 for the files derived from
+  # zenoh-pico and for zenoh-pico itself, compiled in (README.md, License).
+  spec.licenses = ['MIT', 'Apache-2.0']
   spec.authors = ['Katsuhiko Kageyama']
   spec.summary = 'Zenoh (put, subscribe, query, liveliness) on zenoh-pico, polled from Ruby'
 

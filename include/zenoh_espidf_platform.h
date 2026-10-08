@@ -2,13 +2,26 @@
  * Copyright (c) 2022 ZettaScale Technology
  * Copyright (c) 2026 Katsuhiko Kageyama (the changes described below)
  *
- * Derived from zenoh-pico's include/zenoh-pico/system/platform/espidf.h. Like the original, this
- * file is made available under the terms of the Eclipse Public License 2.0
- * (http://www.eclipse.org/legal/epl-2.0) or the Apache License, Version 2.0
- * (https://www.apache.org/licenses/LICENSE-2.0); it is not covered by this
- * repository's MIT license.
+ * Derived from zenoh-pico 1.10.1, include/zenoh-pico/system/platform/espidf.h, whose notice was:
  *
- * SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+ *   Copyright (c) 2022 ZettaScale Technology
+ *
+ *   This program and the accompanying materials are made available under the
+ *   terms of the Eclipse Public License 2.0 which is available at
+ *   http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+ *   which is available at https://www.apache.org/licenses/LICENSE-2.0.
+ *
+ *   SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+ *
+ *   Contributors:
+ *     ZettaScale Zenoh Team, <zenoh@zettascale.tech>
+ *
+ * Of zenoh-pico's two licenses, this repository uses the Apache License,
+ * Version 2.0 (LICENSE-APACHE; zenoh-pico's notices are in NOTICE). This
+ * file has been modified (see below) and is distributed under the Apache
+ * License, Version 2.0, not under this repository's MIT license.
+ *
+ * SPDX-License-Identifier: Apache-2.0
  *
  * zenoh-pico platform types for ESP-IDF, without the ESP-IDF headers.
  *

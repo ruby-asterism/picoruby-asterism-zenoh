@@ -20,6 +20,10 @@
  *   application decides whether to open a new one.
  *
  * Every value can be overridden from the build (e.g. -DZ_FRAG_MAX_SIZE=2048).
+ *
+ * License: this gem's own choice of values for the configuration names
+ * zenoh-pico reads (no text of zenoh-pico's config.h.in is copied), under
+ * this repository's MIT license.
  */
 #ifndef PICORUBY_ZENOH_GENERIC_CONFIG_H
 #define PICORUBY_ZENOH_GENERIC_CONFIG_H

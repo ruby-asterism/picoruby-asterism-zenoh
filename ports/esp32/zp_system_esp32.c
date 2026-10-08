@@ -14,6 +14,12 @@
  * (they are left unused), so the rest of it follows zenoh-pico updates.
  * Compiled by the ESP-IDF component (it needs the ESP-IDF headers); the
  * zenoh-pico core is compiled by the mruby build.
+ *
+ * License: this file holds only this gem's own code (the include, the
+ * renames and the three allocator functions) and is under this repository's
+ * MIT license. The upstream file it includes is not copied here; it stays
+ * zenoh-pico's (EPL-2.0 OR Apache-2.0, used under Apache-2.0, see NOTICE),
+ * and so does that part of the compiled object.
  */
 #include "zenoh-pico/config.h"
 

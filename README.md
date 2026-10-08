@@ -201,8 +201,37 @@ The ESP-IDF files (`ports/esp32/`) need ESP-IDF and are not compiled here.
 
 ## License
 
-MIT (see LICENSE), except the files derived from zenoh-pico, which keep
-zenoh-pico's terms (EPL-2.0 OR Apache-2.0, stated at the top of each file):
-`src/zp_tcp_posix.c`, `src/zp_network_posix.c`, `ports/esp32/zp_tcp_esp32.c`
-and `include/zenoh_espidf_platform.h`. zenoh-pico itself is not part of this
-repository; it is fetched at build time (see Building).
+The gem's own code is under the MIT License (LICENSE).
+
+Four files are derived from [zenoh-pico](https://github.com/eclipse-zenoh/zenoh-pico)
+and are under the **Apache License, Version 2.0** instead (LICENSE-APACHE;
+zenoh-pico's notices are in NOTICE). Each keeps zenoh-pico's copyright
+notice at its top and says what was changed:
+
+- `src/zp_tcp_posix.c` (from `src/link/transport/tcp/tcp_posix.c`)
+- `src/zp_network_posix.c` (from `src/system/unix/network.c`)
+- `ports/esp32/zp_tcp_esp32.c` (from `src/link/transport/tcp/tcp_esp32.c`)
+- `include/zenoh_espidf_platform.h` (from `include/zenoh-pico/system/platform/espidf.h`)
+
+zenoh-pico is offered under EPL-2.0 OR Apache-2.0. This gem takes the
+Apache-2.0 side, for the files above and for zenoh-pico itself when it is
+compiled into a build. Apache-2.0 is also the side that can be combined with
+GPL-3.0 programs (Family mruby's firmware is one).
+
+Two files are this gem's own code and are under MIT, although they touch
+zenoh-pico closely: `ports/esp32/zp_system_esp32.c` only `#include`s
+zenoh-pico's ESP-IDF system file (not copied here) and replaces its
+allocator, and `include/zenoh_generic_config.h` only gives values to the
+configuration names zenoh-pico reads.
+
+### Not in this repository
+
+- **zenoh-pico** (EPL-2.0 OR Apache-2.0): fetched at build time from the
+  commit pinned in `ZENOH_PICO_PIN` (`rake zenoh:fetch`, into `vendor/`,
+  which git ignores) and compiled into the gem. A build or a firmware that
+  contains it must carry zenoh-pico's LICENSE and NOTICE.md (both are in
+  the fetched checkout) along with this repository's LICENSE, LICENSE-APACHE
+  and NOTICE.
+- **mruby**, used only by the host test (`rake test`): fetched from the
+  commit pinned in `host_test/MRUBY_PIN` into `vendor/`. It is not part of
+  the gem.

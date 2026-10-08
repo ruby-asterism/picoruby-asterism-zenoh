@@ -2,19 +2,31 @@
  * Copyright (c) 2026 ZettaScale Technology
  * Copyright (c) 2026 Katsuhiko Kageyama (the changes described below)
  *
- * Derived from zenoh-pico's src/link/transport/tcp/tcp_posix.c. Like the original, this
- * file is made available under the terms of the Eclipse Public License 2.0
- * (http://www.eclipse.org/legal/epl-2.0) or the Apache License, Version 2.0
- * (https://www.apache.org/licenses/LICENSE-2.0); it is not covered by this
- * repository's MIT license.
+ * Derived from zenoh-pico 1.10.1, src/link/transport/tcp/tcp_posix.c, whose notice was:
  *
- * SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+ *   Copyright (c) 2026 ZettaScale Technology
+ *
+ *   This program and the accompanying materials are made available under the
+ *   terms of the Eclipse Public License 2.0 which is available at
+ *   http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+ *   which is available at https://www.apache.org/licenses/LICENSE-2.0.
+ *
+ *   SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+ *
+ *   Contributors:
+ *     ZettaScale Zenoh Team, <zenoh@zettascale.tech>
+ *
+ * Of zenoh-pico's two licenses, this repository uses the Apache License,
+ * Version 2.0 (LICENSE-APACHE; zenoh-pico's notices are in NOTICE). This
+ * file has been modified (see below) and is distributed under the Apache
+ * License, Version 2.0, not under this repository's MIT license.
+ *
+ * SPDX-License-Identifier: Apache-2.0
  *
  * TCP link for zenoh-pico on POSIX, used by picoruby-asterism-zenoh in place of
  * zenoh-pico's src/link/transport/tcp/tcp_posix.c (the gem compiles this file
  * and leaves that one out; the zenoh-pico checkout itself is not edited).
- * Based on that file (Copyright (c) 2026 ZettaScale Technology,
- * EPL-2.0 OR Apache-2.0) with three changes for a polled, single-threaded
+ * Based on that file, with these changes for a polled, single-threaded
  * session living inside an interpreter loop:
  *
  * 1. The plain read (_z_tcp_read) never blocks. It is what the session's read
