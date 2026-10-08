@@ -1,0 +1,7 @@
+# The mruby the host test builds the gem with (rake test). Not a requirement
+# of the gem: it builds with PicoRuby's mruby and any recent mruby 3.x / 4.x.
+# This is the mruby commit PicoRuby's picoruby-mruby submodule carried when
+# the test was written (the one Family mruby builds with). To update: bump
+# the commit, run `rake test`.
+repo: https://github.com/mruby/mruby.git
+commit: f56d44eccbd04723fd9b35cbfaf7088650fd5a72

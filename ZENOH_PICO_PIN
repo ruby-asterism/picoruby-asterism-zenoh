@@ -1,0 +1,16 @@
+# Pinned zenoh-pico (Eclipse Zenoh's C client for microcontrollers), the
+# release this gem is written against (it reaches into a few internals: the
+# session's transport, the TCP link).
+# - `rake zenoh:fetch` clones this exact commit into vendor/zenoh-pico
+#   (gitignored), where mrbgem.rake looks for the sources; ZENOH_PICO_DIR
+#   points the build at another checkout instead.
+# - Family mruby's `rake zenoh:setup` reads this file from its checkout of
+#   this gem and clones the same commit.
+# - The build options (single-threaded, client or unicast peer, TCP only)
+#   are compiler defines set by mrbgem.rake; nothing under vendor/ is edited.
+# - Upstream tag 1.10.1 (zenoh-pico and zenohd release with the same number;
+#   use a zenohd of the same release). To update: bump the tag and commit
+#   here, then run `rake test`.
+repo: https://github.com/eclipse-zenoh/zenoh-pico.git
+tag: 1.10.1
+commit: e1ab223a28aaebb5dec1e70d98eab152332f777a
