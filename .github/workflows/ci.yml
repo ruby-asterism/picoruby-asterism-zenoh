@@ -1,0 +1,27 @@
+# CI for picoruby-asterism-zenoh: `rake` clones the pinned zenoh-pico and
+# mruby, builds mruby with this gem for the host (zenoh-pico's POSIX
+# platform) and runs the host test, two mruby processes over a local TCP
+# peer link. The boards' builds (PicoRuby / ESP-IDF) are not covered here.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host-test:
+    name: host test (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+      - name: rake (fetch zenoh-pico and mruby, build, test)
+        run: rake JOBS=4
+        timeout-minutes: 20
