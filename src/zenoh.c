@@ -55,6 +55,13 @@
 #include "picoruby_zenoh_link.h"
 
 #define ZRB_DEFAULT_DEPTH 16
+/* The queue of a get (and a liveliness get) is allocated in full when the
+ * get is sent: depth entries from zenoh-pico's allocator, which is PSRAM on
+ * ESP-IDF (ports/esp32). A liveliness watch's ring comes from the mruby
+ * allocator (the VM's pool). Both stay small by default on the boards; a
+ * wildcard that can match more answers passes depth:. */
+#define ZRB_DEFAULT_GET_DEPTH 16
+#define ZRB_DEFAULT_WATCH_DEPTH 16
 #define ZRB_MAX_DEPTH 1024
 #define ZRB_DEFAULT_POLL_STEPS 8
 #define ZRB_DEFAULT_GET_TIMEOUT_MS 2000
@@ -786,8 +793,9 @@ static zrb_get *zrb_get_get(mrb_state *mrb, mrb_value self) {
     return g;
 }
 
-/* Allocate a Get object and its context (z_malloc). */
-static mrb_value zrb_get_new(mrb_state *mrb, zrb_get **out) {
+/* Allocate a Get object and its context (z_malloc), with room for depth
+ * replies (past it the oldest go, counted in dropped). */
+static mrb_value zrb_get_new(mrb_state *mrb, mrb_int depth, zrb_get **out) {
     struct RData *data = mrb_data_object_alloc(mrb, zrb_class(mrb, "Get"), NULL, &zrb_get_type);
     mrb_value obj = mrb_obj_value(data);
     zrb_get *g = (zrb_get *)z_malloc(sizeof(zrb_get));
@@ -795,13 +803,13 @@ static mrb_value zrb_get_new(mrb_state *mrb, zrb_get **out) {
         mrb_raise(mrb, zrb_error_class(mrb), "cannot allocate the query");
     }
     memset(g, 0, sizeof(*g));
-    g->ring.slots = (zrb_entry *)z_malloc(sizeof(zrb_entry) * ZRB_DEFAULT_DEPTH);
+    g->ring.slots = (zrb_entry *)z_malloc(sizeof(zrb_entry) * (size_t)depth);
     if (g->ring.slots == NULL) {
         z_free(g);
         mrb_raise(mrb, zrb_error_class(mrb), "cannot allocate the query");
     }
-    memset(g->ring.slots, 0, sizeof(zrb_entry) * ZRB_DEFAULT_DEPTH);
-    g->ring.depth = ZRB_DEFAULT_DEPTH;
+    memset(g->ring.slots, 0, sizeof(zrb_entry) * (size_t)depth);
+    g->ring.depth = (uint32_t)depth;
     g->rb_alive = true;
     data->data = g;
     *out = g;
@@ -1146,7 +1154,7 @@ static mrb_value zrb_session_subscribe(mrb_state *mrb, mrb_value self) {
  * alive when it starts come first, as appearing (alive = true). */
 static mrb_value zrb_session_liveliness_watch(mrb_state *mrb, mrb_value self) {
     const char *key;
-    mrb_int depth = ZRB_DEFAULT_DEPTH;
+    mrb_int depth = ZRB_DEFAULT_WATCH_DEPTH;
     mrb_get_args(mrb, "z|i", &key, &depth);
     zrb_check_depth(mrb, depth);
     zrb_session *z = zrb_session_get_open(mrb, self);
@@ -1239,21 +1247,35 @@ static z_query_consolidation_t zrb_get_consolidation(mrb_state *mrb, mrb_value v
     return z_query_consolidation_none(); /* not reached */
 }
 
+/* A get's depth: keyword (nil or not given: the default). */
+static mrb_int zrb_kw_get_depth(mrb_state *mrb, mrb_value v) {
+    if (mrb_undef_p(v) || mrb_nil_p(v)) {
+        return ZRB_DEFAULT_GET_DEPTH;
+    }
+    if (!mrb_integer_p(v)) {
+        mrb_raise(mrb, E_TYPE_ERROR, "depth must be an Integer");
+    }
+    return zrb_check_depth(mrb, mrb_integer(v));
+}
+
 /* session.get(key, timeout_ms = 2000, params = nil, payload = nil,
- *             attachment: nil, target: :all, consolidation: :none) -> Get.
+ *             attachment: nil, target: :all, consolidation: :none,
+ *             depth: 16) -> Get.
  * Returns at once; the replies come in with later polls. By default every
- * matching queryable is asked and every reply is kept. */
+ * matching queryable is asked and every reply is kept, up to depth waiting
+ * to be taken. */
 static mrb_value zrb_session_get_m(mrb_state *mrb, mrb_value self) {
     const char *key;
     mrb_int timeout_ms = ZRB_DEFAULT_GET_TIMEOUT_MS;
     const char *params = NULL;
     mrb_value payload = mrb_nil_value();
-    mrb_sym kw_names[3] = {mrb_intern_lit(mrb, "attachment"), mrb_intern_lit(mrb, "target"),
-                           mrb_intern_lit(mrb, "consolidation")};
-    mrb_value kw_values[3];
-    mrb_kwargs kwargs = {3, 0, kw_names, kw_values, NULL};
+    mrb_sym kw_names[4] = {mrb_intern_lit(mrb, "attachment"), mrb_intern_lit(mrb, "target"),
+                           mrb_intern_lit(mrb, "consolidation"), mrb_intern_lit(mrb, "depth")};
+    mrb_value kw_values[4];
+    mrb_kwargs kwargs = {4, 0, kw_names, kw_values, NULL};
     mrb_get_args(mrb, "z|iz!o:", &key, &timeout_ms, &params, &payload, &kwargs);
     zrb_check_timeout(mrb, timeout_ms);
+    mrb_int depth = zrb_kw_get_depth(mrb, kw_values[3]);
     if (!mrb_nil_p(payload) && !mrb_string_p(payload)) {
         mrb_raise(mrb, E_TYPE_ERROR, "payload must be a String");
     }
@@ -1265,7 +1287,7 @@ static mrb_value zrb_session_get_m(mrb_state *mrb, mrb_value self) {
     zrb_view_key(mrb, &ke, key);
 
     zrb_get *g;
-    mrb_value obj = zrb_get_new(mrb, &g);
+    mrb_value obj = zrb_get_new(mrb, depth, &g);
 
     z_get_options_t opts;
     z_get_options_default(&opts);
@@ -1327,19 +1349,23 @@ static mrb_value zrb_session_liveliness(mrb_state *mrb, mrb_value self) {
     return obj;
 }
 
-/* session.liveliness_get(key, timeout_ms = 2000) -> Get. Each reply is a
- * token alive now (key, empty payload). */
+/* session.liveliness_get(key, timeout_ms = 2000, depth: 16) -> Get. Each
+ * reply is a token alive now (key, empty payload). */
 static mrb_value zrb_session_liveliness_get(mrb_state *mrb, mrb_value self) {
     const char *key;
     mrb_int timeout_ms = ZRB_DEFAULT_GET_TIMEOUT_MS;
-    mrb_get_args(mrb, "z|i", &key, &timeout_ms);
+    mrb_sym kw_names[1] = {mrb_intern_lit(mrb, "depth")};
+    mrb_value kw_values[1];
+    mrb_kwargs kwargs = {1, 0, kw_names, kw_values, NULL};
+    mrb_get_args(mrb, "z|i:", &key, &timeout_ms, &kwargs);
     zrb_check_timeout(mrb, timeout_ms);
+    mrb_int depth = zrb_kw_get_depth(mrb, kw_values[0]);
     zrb_session *z = zrb_session_get_open(mrb, self);
     z_view_keyexpr_t ke;
     zrb_view_key(mrb, &ke, key);
 
     zrb_get *g;
-    mrb_value obj = zrb_get_new(mrb, &g);
+    mrb_value obj = zrb_get_new(mrb, depth, &g);
     z_liveliness_get_options_t opts;
     z_liveliness_get_options_default(&opts);
     opts.timeout_ms = (uint64_t)timeout_ms;
@@ -1433,6 +1459,12 @@ void mrb_picoruby_asterism_zenoh_gem_init(mrb_state *mrb) {
     mrb_define_const(mrb, mod, "SEND_TIMEOUT_MS", mrb_fixnum_value(PICORUBY_ZENOH_SEND_TIMEOUT_MS));
     mrb_define_const(mrb, mod, "PEER", mrb_bool_value(Z_FEATURE_UNICAST_PEER == 1));
     mrb_define_const(mrb, mod, "MAX_PEERS", mrb_fixnum_value(Z_LISTEN_MAX_CONNECTION_NB));
+    /* Queue depths: the default of subscribe and queryable; of get and
+     * liveliness_get; of liveliness_watch; and the largest accepted. */
+    mrb_define_const(mrb, mod, "DEFAULT_DEPTH", mrb_fixnum_value(ZRB_DEFAULT_DEPTH));
+    mrb_define_const(mrb, mod, "DEFAULT_GET_DEPTH", mrb_fixnum_value(ZRB_DEFAULT_GET_DEPTH));
+    mrb_define_const(mrb, mod, "DEFAULT_WATCH_DEPTH", mrb_fixnum_value(ZRB_DEFAULT_WATCH_DEPTH));
+    mrb_define_const(mrb, mod, "MAX_DEPTH", mrb_fixnum_value(ZRB_MAX_DEPTH));
 
     struct RClass *ses = mrb_define_class_under(mrb, mod, "Session", mrb->object_class);
     MRB_SET_INSTANCE_TT(ses, MRB_TT_CDATA);
@@ -1440,11 +1472,11 @@ void mrb_picoruby_asterism_zenoh_gem_init(mrb_state *mrb) {
     mrb_define_class_method(mrb, ses, "open", zrb_session_s_open, MRB_ARGS_OPT(1) | MRB_ARGS_KEY(2, 0));
     mrb_define_method(mrb, ses, "put", zrb_session_put, MRB_ARGS_REQ(2) | MRB_ARGS_KEY(1, 0));
     mrb_define_method(mrb, ses, "subscribe", zrb_session_subscribe, MRB_ARGS_ARG(1, 1));
-    mrb_define_method(mrb, ses, "get", zrb_session_get_m, MRB_ARGS_ARG(1, 3) | MRB_ARGS_KEY(3, 0));
+    mrb_define_method(mrb, ses, "get", zrb_session_get_m, MRB_ARGS_ARG(1, 3) | MRB_ARGS_KEY(4, 0));
     mrb_define_method(mrb, ses, "queryable", zrb_session_queryable, MRB_ARGS_ARG(1, 1) | MRB_ARGS_KEY(1, 0));
     mrb_define_method(mrb, ses, "liveliness", zrb_session_liveliness, MRB_ARGS_REQ(1));
     mrb_define_method(mrb, ses, "liveliness_watch", zrb_session_liveliness_watch, MRB_ARGS_ARG(1, 1));
-    mrb_define_method(mrb, ses, "liveliness_get", zrb_session_liveliness_get, MRB_ARGS_ARG(1, 1));
+    mrb_define_method(mrb, ses, "liveliness_get", zrb_session_liveliness_get, MRB_ARGS_ARG(1, 1) | MRB_ARGS_KEY(1, 0));
     mrb_define_method(mrb, ses, "poll", zrb_session_poll, MRB_ARGS_OPT(1));
     mrb_define_method(mrb, ses, "connection_count", zrb_session_connection_count, MRB_ARGS_NONE());
     mrb_define_method(mrb, ses, "zid", zrb_session_zid, MRB_ARGS_NONE());

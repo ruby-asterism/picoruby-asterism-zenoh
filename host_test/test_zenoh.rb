@@ -136,6 +136,25 @@ check(wait_for(s, 4) { g2.done? }, "get with nobody to answer ends")
 check(g2.each_reply == [], "no replies")
 raises(ArgumentError, "bad target") { s.get("pz/q/x", timeout_ms: 100, target: :bogus) }
 
+# ---- queue depths: a burst of replies -------------------------------------------
+BURST = 40 # listener.rb answers pz/q/burst/** with this many, and holds as many tokens
+check(Z::DEFAULT_DEPTH == 16 && Z::DEFAULT_GET_DEPTH == 16 && Z::DEFAULT_WATCH_DEPTH == 16 &&
+      Z::MAX_DEPTH == 1024, "depth constants")
+gb = s.get("pz/q/burst/**")
+check(wait_for(s) { gb.done? }, "burst get done")
+check(gb.each_reply.size == 16 && gb.dropped == BURST - 16, "default depth keeps 16 (dropped #{gb.dropped})")
+gd = s.get("pz/q/burst/**", depth: 64)
+check(wait_for(s) { gd.done? }, "deep burst get done")
+got = gd.each_reply
+check(got.size == BURST && gd.dropped == 0, "depth: 64 keeps all #{BURST} (got #{got.size}, dropped #{gd.dropped})")
+check(got.map { |r| r[1] } == (0...BURST).map { |i| i.to_s }, "in order")
+gs = s.get("pz/q/burst/**", timeout: 2.0, depth: 4)
+check(wait_for(s) { gs.done? }, "shallow burst get done")
+check(gs.each_reply.map { |r| r[1] } == %w[36 37 38 39] && gs.dropped == BURST - 4, "depth: 4 keeps the newest four")
+raises(ArgumentError, "get depth: 0") { s.get("pz/q/x", depth: 0) }
+raises(ArgumentError, "get depth: 1025") { s.get("pz/q/x", depth: 1025) }
+raises(ArgumentError, "liveliness_get depth: 0") { s.liveliness_get("pz/lv/**", depth: 0) }
+
 # ---- liveliness ---------------------------------------------------------------
 # Not checked here: liveliness_get between two zenoh-pico peers gets no
 # reply and its Get never turns done? (found with this test, 2026-10-08;
@@ -143,6 +162,20 @@ raises(ArgumentError, "bad target") { s.get("pz/q/x", timeout_ms: 100, target: :
 w = s.liveliness_watch("pz/alive/**")
 check(wait_for(s) { w.pending >= 1 }, "watch reports the token alive now")
 check(w.each_pending == [["pz/alive/a", true]], "watch: a up")
+# The tokens alive now come in one burst.
+wd = s.liveliness_watch("pz/lv/**", depth: 64)
+ws = s.liveliness_watch("pz/lv/**")
+check(wait_for(s) { wd.received == BURST && ws.received == BURST }, "watches got the burst (#{wd.received}, #{ws.received})")
+check(wd.each_pending.size == BURST && wd.dropped == 0, "depth: 64 watch keeps all")
+check(ws.each_pending.size == 16 && ws.dropped == BURST - 16, "default watch keeps 16 (dropped #{ws.dropped})")
+wd.close
+ws.close
+lg = s.liveliness_get("pz/lv/**", timeout: 0.5, depth: 64)
+check(lg.dropped == 0, "liveliness_get takes depth:")
+# warn_once: once per object.
+o1 = Object.new
+check(Asterism.warn_once(o1, "asterism: host test warning (expected)") == true, "warn_once warns")
+check(Asterism.warn_once(o1, "asterism: host test warning (not shown)") == false, "warn_once once per object")
 
 # ---- the listener goes away ------------------------------------------------------
 s.put("pz/in/stop", "")

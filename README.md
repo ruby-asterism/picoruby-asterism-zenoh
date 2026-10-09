@@ -52,10 +52,10 @@ end
 | `sub.each_pending { \|key, payload, attachment\| }` | Integer | Takes out the values received so far (oldest first). `attachment` is a String, or nil when the sample had none (or an empty one). Without a block, returns them as `[[key, payload, attachment], ...]`. |
 | `sub.pending` / `sub.received` / `sub.dropped` | Integer | Waiting values / total received / dropped because the ring was full (the oldest goes). |
 | `sub.close` / `sub.closed?` | | Pending values can still be taken after close. |
-| `session.get(key, timeout: 2.0, params: nil, payload: nil, attachment: nil, target: :all, consolidation: :none)` | `Get` | Sends a query and returns at once. `timeout:` is seconds; `timeout_ms:` (1..600000) is the same in milliseconds. `attachment:` is a String sent with the query, or nil. `target:` `:all` (every matching queryable, the default), `:all_complete` (only queryables declared `complete: true`; what ROS 2's rmw_zenoh clients send) or `:best_matching`. `consolidation:` `:none` (every reply is kept, the default; zenoh's own default is `:auto`), `:latest`, `:monotonic` or `:auto`. |
+| `session.get(key, timeout: 2.0, params: nil, payload: nil, attachment: nil, target: :all, consolidation: :none, depth: 16)` | `Get` | Sends a query and returns at once. `depth:` (1..1024) is how many replies are kept until taken (see Queue depths). `timeout:` is seconds; `timeout_ms:` (1..600000) is the same in milliseconds. `attachment:` is a String sent with the query, or nil. `target:` `:all` (every matching queryable, the default), `:all_complete` (only queryables declared `complete: true`; what ROS 2's rmw_zenoh clients send) or `:best_matching`. `consolidation:` `:none` (every reply is kept, the default; zenoh's own default is `:auto`), `:latest`, `:monotonic` or `:auto`. |
 | `get.each_reply { \|key, payload, attachment\| }` | Integer | Replies received so far (oldest first); `attachment` is a String, or nil when the reply had none. Without a block, an Array of `[key, payload, attachment]`. Error replies are not yielded, only counted. |
 | `get.done?` | `true` / `false` | True once every replier has finished, the time limit has passed, or the session closed. The limit is checked once a second by `poll`, so `done?` turns true up to about 1 s after it. |
-| `get.pending` / `received` / `dropped` / `errors` | Integer | Up to 16 replies are kept; more drop the oldest. |
+| `get.pending` / `received` / `dropped` / `errors` | Integer | Up to `depth` replies (16 by default) are kept; more drop the oldest, counted in `dropped`. |
 | `session.queryable(key, depth: 16, complete: false)` | `Queryable` | Answers queries matching `key`. Up to `depth` unanswered queries are kept; more finish the oldest unanswered (the requester gets nothing from it) and count it as dropped. `complete: true` declares that it answers for every key matching `key`; only such queryables receive queries sent with `target: :all_complete`. |
 | `queryable.each_pending { \|q\| }` | Integer | Takes out the waiting queries. Each is finished when the block returns (also when it raises). Without a block: an Array of `Query`, each open until `q.finish` or garbage collection. |
 | `queryable.pending` / `received` / `dropped` / `close` / `closed?` | | |
@@ -65,7 +65,7 @@ end
 | `q.finish` / `q.finished?` | | Sends the final reply: the requester's `done?` turns true when every queryable has finished. |
 | `session.liveliness(key)` | `LivelinessToken` | Announces `key` as alive until `token.close`, garbage collection, or the session closing. |
 | `session.liveliness_watch(key, depth: 16)` | `LivelinessWatch` | `each_pending { \|key, alive\| }` (alive is `true` when a token appeared, `false` when it went away); the tokens alive when the watch starts come first. Tokens of the same session are not reported (zenoh-pico does not report its own). Also `pending` / `received` / `dropped` / `close` / `closed?`. |
-| `session.liveliness_get(key, timeout: 2.0)` | `Get` | The tokens alive now, as replies (empty payload). Or `timeout_ms:`. |
+| `session.liveliness_get(key, timeout: 2.0, depth: 16)` | `Get` | The tokens alive now, as replies (empty payload). Or `timeout_ms:`. `depth:` as for `get`. |
 | `Asterism::Zenoh::PICO_VERSION` / `BACKEND_VERSION` | String | zenoh-pico version compiled in. |
 | `Asterism::Zenoh::BACKEND` / `VERSION` | `:zenoh_pico` / String | `:zenoh_c` on CRuby; the gem's version (the same as asterism-zenoh's). |
 | `Asterism::Error` > `Asterism::Zenoh::Error` > `Asterism::Zenoh::ClosedError` | | `ClosedError`: the session is closed or its connection was lost. `Error#code`: zenoh-pico's result code when there was one. |
@@ -147,6 +147,16 @@ opens a new session (`Asterism::Zenoh::Session.open` again).
   The gem does not depend on any host-specific allocator so that it builds
   with plain PicoRuby / mruby. On ESP-IDF, `z_malloc` takes external RAM
   (PSRAM) only (`ports/esp32/zp_system_esp32.c`).
+- **Queue depths**: a router answers a wildcard get or liveliness get, and
+  a new liveliness watch, with everything at once, so a queue holds at
+  most `depth` of the burst and drops the oldest of the rest (`dropped`).
+  The defaults stay at 16 here (`DEFAULT_DEPTH`, `DEFAULT_GET_DEPTH`,
+  `DEFAULT_WATCH_DEPTH`; the largest is `MAX_DEPTH`, 1024): a get's queue is
+  allocated in full when the get is sent (`depth` entries of 20 bytes on a
+  32-bit board, from `z_malloc`, so PSRAM on ESP-IDF), and a watch's from
+  the mruby allocator (the VM's pool), whether or not anything comes. Pass
+  `depth:` when a wildcard can match more; the CRuby binding defaults to
+  1024 for these three.
 - **Cleanup**: `close` is optional. Garbage-collecting (or closing the VM
   with) a `Session` or `Subscriber` closes the zenoh-pico side, in either
   order.

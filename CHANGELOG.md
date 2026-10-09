@@ -16,6 +16,14 @@ Added
 - `timeout:` (seconds) and `timeout_ms:` on `get` and `liveliness_get`;
   `params:` and `payload:` on `get`; `depth:` on `subscribe`, `queryable`
   and `liveliness_watch`. Giving a time limit twice raises `ArgumentError`.
+- `depth:` on `get` and `liveliness_get` (1..1024): the replies kept
+  until taken. Before, a get's queue held 16 and could not be changed, so
+  the replies to a wildcard past the 16th were dropped. The default stays
+  16 on the boards (the queue is allocated in full, in PSRAM on ESP-IDF);
+  the CRuby binding's is 1024.
+- `DEFAULT_DEPTH`, `DEFAULT_GET_DEPTH`, `DEFAULT_WATCH_DEPTH` (all 16) and
+  `MAX_DEPTH` (1024).
+- `Asterism.warn_once(obj, message)`: warns once per object.
 - `Session#connection_count`.
 - One error tree: `Asterism::Error` > `Asterism::Zenoh::Error` >
   `Asterism::Zenoh::ClosedError` (the session is closed or its connection

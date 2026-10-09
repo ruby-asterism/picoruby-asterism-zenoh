@@ -9,9 +9,11 @@
 # - put on pz/in/<name> comes back as pz/out/<name>, same payload and
 #   attachment; pz/in/stop closes this side
 # - queries on pz/q/** get one reply: "re:<payload>:<params>:<queryable key>", with the
-#   query's attachment
-# - holds the liveliness token pz/alive/a
+#   query's attachment; a query on pz/q/burst/** gets BURST replies at once
+#   (pz/q/burst/k<i>, payload i)
+# - holds the liveliness token pz/alive/a, and BURST tokens pz/lv/t<i>
 port = ARGV[0]
+BURST = 40
 
 # The queryable's key that the binding puts on each query (read by
 # Query#reply; this build has no instance_variable_get).
@@ -25,6 +27,8 @@ s = Asterism::Zenoh::Session.open(nil, mode: :peer, listen: "tcp/127.0.0.1:#{por
 sub = s.subscribe("pz/in/**", depth: 64)
 qa = s.queryable("pz/q/**")
 tok = s.liveliness("pz/alive/a")
+burst = []
+BURST.times { |i| burst << s.liveliness("pz/lv/t#{i}") }
 puts "ready #{s.zid}"
 
 stop = false
@@ -42,10 +46,15 @@ until stop || Time.now > deadline
   qa.each_pending do |q|
     # The queryable's own key rides on each query (0.4.0); echo it back.
     own = q.test_queryable_key
-    q.reply(q.key, "re:#{q.payload}:#{q.params}:#{own}", attachment: q.attachment)
+    if q.key == "pz/q/burst/**"
+      BURST.times { |i| q.reply("pz/q/burst/k#{i}", i.to_s) }
+    else
+      q.reply(q.key, "re:#{q.payload}:#{q.params}:#{own}", attachment: q.attachment)
+    end
   end
   usleep 2000
 end
 tok.close
+burst.each(&:close)
 s.close
 puts "listener done"
