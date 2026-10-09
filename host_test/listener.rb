@@ -8,12 +8,21 @@
 #
 # - put on pz/in/<name> comes back as pz/out/<name>, same payload and
 #   attachment; pz/in/stop closes this side
-# - queries on pz/q/** get one reply: "re:<payload>:<params>", with the
+# - queries on pz/q/** get one reply: "re:<payload>:<params>:<queryable key>", with the
 #   query's attachment
 # - holds the liveliness token pz/alive/a
 port = ARGV[0]
+
+# The queryable's key that the binding puts on each query (read by
+# Query#reply; this build has no instance_variable_get).
+class Asterism::Zenoh::Query
+  def test_queryable_key
+    @asterism_queryable_key
+  end
+end
+
 s = Asterism::Zenoh::Session.open(nil, mode: :peer, listen: "tcp/127.0.0.1:#{port}")
-sub = s.subscribe("pz/in/**", 64)
+sub = s.subscribe("pz/in/**", depth: 64)
 qa = s.queryable("pz/q/**")
 tok = s.liveliness("pz/alive/a")
 puts "ready #{s.zid}"
@@ -31,7 +40,9 @@ until stop || Time.now > deadline
     end
   end
   qa.each_pending do |q|
-    q.reply(q.key, "re:#{q.payload}:#{q.params}", attachment: q.attachment)
+    # The queryable's own key rides on each query (0.4.0); echo it back.
+    own = q.test_queryable_key
+    q.reply(q.key, "re:#{q.payload}:#{q.params}:#{own}", attachment: q.attachment)
   end
   usleep 2000
 end

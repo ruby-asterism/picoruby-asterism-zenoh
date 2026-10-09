@@ -35,6 +35,7 @@
  * closure's drop when the query is finished or times out); whichever lets go
  * last frees it.
  */
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -155,6 +156,21 @@ static struct RClass *zrb_class(mrb_state *mrb, const char *name) {
 }
 
 static struct RClass *zrb_error_class(mrb_state *mrb) { return zrb_class(mrb, "Error"); }
+
+/* The session is closed, or its connection was lost. */
+static struct RClass *zrb_closed_class(mrb_state *mrb) { return zrb_class(mrb, "ClosedError"); }
+
+/* Raises cls with zenoh-pico's result code as the exception's code
+ * (Asterism::Zenoh::Error#code) as well as in the message. */
+static mrb_noreturn void zrb_raise_code(mrb_state *mrb, struct RClass *cls, int code, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    mrb_value msg = mrb_vformat(mrb, fmt, ap);
+    va_end(ap);
+    mrb_value exc = mrb_exc_new_str(mrb, cls, msg);
+    mrb_iv_set(mrb, exc, mrb_intern_lit(mrb, "@code"), mrb_fixnum_value(code));
+    mrb_exc_raise(mrb, exc);
+}
 
 static void zrb_view_key(mrb_state *mrb, z_view_keyexpr_t *ke, const char *key) {
     if (z_view_keyexpr_from_str(ke, key) != Z_OK) {
@@ -525,6 +541,9 @@ static mrb_value zrb_qable_each_pending(mrb_state *mrb, mrb_value self) {
     mrb_get_args(mrb, "&", &blk);
     zrb_qable *q = zrb_qable_get(mrb, self);
     bool collect = mrb_nil_p(blk);
+    /* The queryable's own key goes with each query (Query#reply with one
+     * argument looks at it); the same String, not a copy. */
+    mrb_value qkey = mrb_iv_get(mrb, self, mrb_intern_lit(mrb, "@key"));
     mrb_value out = collect ? mrb_ary_new(mrb) : mrb_nil_value();
     mrb_int taken = 0;
     uint32_t todo = q->count;
@@ -532,6 +551,9 @@ static mrb_value zrb_qable_each_pending(mrb_state *mrb, mrb_value self) {
         todo--;
         int ai = mrb_gc_arena_save(mrb);
         mrb_value obj = zrb_query_wrap(mrb, &q->slots[q->head]);
+        if (!mrb_nil_p(qkey)) {
+            mrb_iv_set(mrb, obj, mrb_intern_lit(mrb, "@asterism_queryable_key"), qkey);
+        }
         q->head = (q->head + 1) % q->depth;
         q->count--;
         taken++;
@@ -690,7 +712,7 @@ static mrb_value zrb_query_reply(mrb_state *mrb, mrb_value self) {
     }
     z_result_t ret = z_query_reply(z_loan(zq->query), kp, z_move(bytes), &opts);
     if (ret != Z_OK) {
-        mrb_raisef(mrb, zrb_error_class(mrb), "reply failed (%d)", (int)ret);
+        zrb_raise_code(mrb, zrb_error_class(mrb), (int)ret, "reply failed (%d)", (int)ret);
     }
     return mrb_nil_value();
 }
@@ -951,7 +973,7 @@ static bool zrb_session_check_link(zrb_session *z) {
 static zrb_session *zrb_session_get_open(mrb_state *mrb, mrb_value self) {
     zrb_session *z = zrb_session_get(mrb, self);
     if (zrb_session_check_link(z)) {
-        mrb_raise(mrb, zrb_error_class(mrb), "session is closed");
+        mrb_raise(mrb, zrb_closed_class(mrb), "session is closed");
     }
     return z;
 }
@@ -1025,7 +1047,7 @@ static mrb_value zrb_session_s_open(mrb_state *mrb, mrb_value klass) {
     }
     z_result_t ret = z_open(&z->session, z_move(config), NULL);
     if (ret != Z_OK) {
-        mrb_raisef(mrb, zrb_error_class(mrb), "cannot open a session to %s (%d)",
+        zrb_raise_code(mrb, zrb_error_class(mrb), (int)ret, "cannot open a session to %s (%d)",
                    locator != NULL ? locator : listen, (int)ret);
     }
     z->open = true;
@@ -1063,10 +1085,10 @@ static mrb_value zrb_session_put(mrb_state *mrb, mrb_value self) {
     }
     z_result_t ret = z_put(z_loan(z->session), z_loan(ke), z_move(bytes), &opts);
     if (zrb_session_check_link(z)) {
-        mrb_raisef(mrb, zrb_error_class(mrb), "put failed: the connection is lost (%d)", (int)ret);
+        zrb_raise_code(mrb, zrb_closed_class(mrb), (int)ret, "put failed: the connection is lost (%d)", (int)ret);
     }
     if (ret != Z_OK) {
-        mrb_raisef(mrb, zrb_error_class(mrb), "put failed (%d)", (int)ret);
+        zrb_raise_code(mrb, zrb_error_class(mrb), (int)ret, "put failed (%d)", (int)ret);
     }
     return mrb_nil_value();
 }
@@ -1100,7 +1122,7 @@ static mrb_value zrb_sub_new(mrb_state *mrb, mrb_value self, zrb_session *z, con
         ret = z_declare_subscriber(z_loan(z->session), &s->sub, z_loan(ke), z_move(cb), NULL);
     }
     if (ret != Z_OK) {
-        mrb_raisef(mrb, zrb_error_class(mrb), "cannot subscribe to %s (%d)", key, (int)ret);
+        zrb_raise_code(mrb, zrb_error_class(mrb), (int)ret, "cannot subscribe to %s (%d)", key, (int)ret);
     }
     s->declared = true;
     s->owner = z;
@@ -1166,7 +1188,7 @@ static mrb_value zrb_session_queryable(mrb_state *mrb, mrb_value self) {
     qopts.complete = complete;
     z_result_t ret = z_declare_queryable(z_loan(z->session), &q->qable, z_loan(ke), z_move(cb), &qopts);
     if (ret != Z_OK) {
-        mrb_raisef(mrb, zrb_error_class(mrb), "cannot declare a queryable on %s (%d)", key, (int)ret);
+        zrb_raise_code(mrb, zrb_error_class(mrb), (int)ret, "cannot declare a queryable on %s (%d)", key, (int)ret);
     }
     q->declared = true;
     q->owner = z;
@@ -1270,10 +1292,10 @@ static mrb_value zrb_session_get_m(mrb_state *mrb, mrb_value self) {
     /* On failure zenoh-pico has already run the drop callback (done = true). */
     z_result_t ret = z_get(z_loan(z->session), z_loan(ke), params, z_move(cb), &opts);
     if (zrb_session_check_link(z)) {
-        mrb_raisef(mrb, zrb_error_class(mrb), "get failed: the connection is lost (%d)", (int)ret);
+        zrb_raise_code(mrb, zrb_closed_class(mrb), (int)ret, "get failed: the connection is lost (%d)", (int)ret);
     }
     if (ret != Z_OK) {
-        mrb_raisef(mrb, zrb_error_class(mrb), "get failed (%d)", (int)ret);
+        zrb_raise_code(mrb, zrb_error_class(mrb), (int)ret, "get failed (%d)", (int)ret);
     }
     zrb_hold_session(mrb, obj, self, key);
     return obj;
@@ -1295,7 +1317,7 @@ static mrb_value zrb_session_liveliness(mrb_state *mrb, mrb_value self) {
     mrb_value obj = mrb_obj_value(data);
     z_result_t ret = z_liveliness_declare_token(z_loan(z->session), &t->token, z_loan(ke), NULL);
     if (ret != Z_OK) {
-        mrb_raisef(mrb, zrb_error_class(mrb), "cannot declare a liveliness token on %s (%d)", key, (int)ret);
+        zrb_raise_code(mrb, zrb_error_class(mrb), (int)ret, "cannot declare a liveliness token on %s (%d)", key, (int)ret);
     }
     t->declared = true;
     t->owner = z;
@@ -1325,10 +1347,10 @@ static mrb_value zrb_session_liveliness_get(mrb_state *mrb, mrb_value self) {
     z_closure(&cb, zrb_on_reply, zrb_on_reply_drop, g);
     z_result_t ret = z_liveliness_get(z_loan(z->session), z_loan(ke), z_move(cb), &opts);
     if (zrb_session_check_link(z)) {
-        mrb_raisef(mrb, zrb_error_class(mrb), "liveliness_get failed: the connection is lost (%d)", (int)ret);
+        zrb_raise_code(mrb, zrb_closed_class(mrb), (int)ret, "liveliness_get failed: the connection is lost (%d)", (int)ret);
     }
     if (ret != Z_OK) {
-        mrb_raisef(mrb, zrb_error_class(mrb), "liveliness_get failed (%d)", (int)ret);
+        zrb_raise_code(mrb, zrb_error_class(mrb), (int)ret, "liveliness_get failed (%d)", (int)ret);
     }
     zrb_hold_session(mrb, obj, self, key);
     return obj;
@@ -1367,8 +1389,6 @@ static mrb_value zrb_session_close(mrb_state *mrb, mrb_value self) {
     return mrb_nil_value();
 }
 
-/* session.peers -> Integer: connected peers (peer mode), or 1 / 0 for the
- * router of a client session. */
 /* session.zid -> String: this session's Zenoh ID in hex. */
 static mrb_value zrb_session_zid(mrb_state *mrb, mrb_value self) {
     zrb_session *z = zrb_session_get_open(mrb, self);
@@ -1382,7 +1402,10 @@ static mrb_value zrb_session_zid(mrb_state *mrb, mrb_value self) {
     return out;
 }
 
-static mrb_value zrb_session_peers(mrb_state *mrb, mrb_value self) {
+/* session.connection_count -> Integer: connected peers (peer mode), or
+ * 1 / 0 for the router of a client session. (peers, its old name, is
+ * defined in Ruby with a deprecation warning: mrblib/common.rb.) */
+static mrb_value zrb_session_connection_count(mrb_state *mrb, mrb_value self) {
     zrb_session *z = zrb_session_get(mrb, self);
     if (zrb_session_check_link(z)) {
         return mrb_fixnum_value(0);
@@ -1400,7 +1423,11 @@ void mrb_picoruby_asterism_zenoh_gem_init(mrb_state *mrb) {
     /* Asterism::Zenoh. No top-level Zenoh is defined (doc/ruby_asterism/design.md). */
     struct RClass *asterism = mrb_define_module(mrb, "Asterism");
     struct RClass *mod = mrb_define_module_under(mrb, asterism, "Zenoh");
-    mrb_define_class_under(mrb, mod, "Error", mrb->eStandardError_class);
+    /* The root of every Asterism error. Defined here because this binding
+     * loads first; picoruby-asterism reopens it (same superclass). */
+    struct RClass *asterism_error = mrb_define_class_under(mrb, asterism, "Error", mrb->eStandardError_class);
+    struct RClass *zenoh_error = mrb_define_class_under(mrb, mod, "Error", asterism_error);
+    mrb_define_class_under(mrb, mod, "ClosedError", zenoh_error);
     mrb_define_const(mrb, mod, "PICO_VERSION", mrb_str_new_cstr(mrb, ZENOH_PICO));
     mrb_define_const(mrb, mod, "CONNECT_TIMEOUT_MS", mrb_fixnum_value(PICORUBY_ZENOH_CONNECT_TIMEOUT_MS));
     mrb_define_const(mrb, mod, "SEND_TIMEOUT_MS", mrb_fixnum_value(PICORUBY_ZENOH_SEND_TIMEOUT_MS));
@@ -1419,7 +1446,7 @@ void mrb_picoruby_asterism_zenoh_gem_init(mrb_state *mrb) {
     mrb_define_method(mrb, ses, "liveliness_watch", zrb_session_liveliness_watch, MRB_ARGS_ARG(1, 1));
     mrb_define_method(mrb, ses, "liveliness_get", zrb_session_liveliness_get, MRB_ARGS_ARG(1, 1));
     mrb_define_method(mrb, ses, "poll", zrb_session_poll, MRB_ARGS_OPT(1));
-    mrb_define_method(mrb, ses, "peers", zrb_session_peers, MRB_ARGS_NONE());
+    mrb_define_method(mrb, ses, "connection_count", zrb_session_connection_count, MRB_ARGS_NONE());
     mrb_define_method(mrb, ses, "zid", zrb_session_zid, MRB_ARGS_NONE());
     mrb_define_method(mrb, ses, "closed?", zrb_session_closed_p, MRB_ARGS_NONE());
     mrb_define_method(mrb, ses, "close", zrb_session_close, MRB_ARGS_NONE());
