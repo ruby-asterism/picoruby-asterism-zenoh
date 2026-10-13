@@ -4,7 +4,7 @@
 module Asterism
   module Zenoh
     # The gem's version (the same as asterism-zenoh's from 0.4.0 on).
-    VERSION = "0.4.0"
+    VERSION = "0.4.1"
     # Which Zenoh implementation is underneath (:zenoh_c on CRuby).
     BACKEND = :zenoh_pico
     # Its version (PICO_VERSION here, C_VERSION on CRuby).
