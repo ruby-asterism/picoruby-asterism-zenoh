@@ -51,7 +51,10 @@
  *
  * _z_tcp_read_exact (session handshake) still waits, up to the socket timeout
  * per call, and keeps waiting once a message has started arriving so a
- * partially received message is never cut in half.
+ * partially received message is never cut in half. A socket that fails (a
+ * reset) ends it like a closed connection, as in ports/esp32/zp_tcp_esp32.c
+ * (where lwIP reports the reset on every later recv and waiting again never
+ * ended).
  */
 #include "zenoh-pico/link/transport/tcp.h"
 
@@ -253,8 +256,13 @@ void _z_tcp_close(_z_sys_net_socket_t *sock) {
 }
 
 /* One recv() that does not wait: SIZE_MAX when nothing is there (or on a
- * transient error), 0 when the peer closed, otherwise the byte count. */
-static size_t zp_recv_now(int fd, uint8_t *ptr, size_t len) {
+ * transient error), 0 when the peer closed, otherwise the byte count.
+ * *failed (when given) is set when the socket itself failed (a reset, or
+ * any error but "would block"): another recv will not do better. */
+static size_t zp_recv_now(int fd, uint8_t *ptr, size_t len, bool *failed) {
+    if (failed != NULL) {
+        *failed = false;
+    }
     for (;;) {
         ssize_t rb = recv(fd, ptr, len, MSG_DONTWAIT);
         if (rb >= 0) {
@@ -265,12 +273,15 @@ static size_t zp_recv_now(int fd, uint8_t *ptr, size_t len) {
         }
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
             _Z_DEBUG("Errno: %d\n", errno);
+            if (failed != NULL) {
+                *failed = true;
+            }
         }
         return SIZE_MAX;
     }
 }
 
-size_t _z_tcp_read(_z_sys_net_socket_t sock, uint8_t *ptr, size_t len) { return zp_recv_now(sock._fd, ptr, len); }
+size_t _z_tcp_read(_z_sys_net_socket_t sock, uint8_t *ptr, size_t len) { return zp_recv_now(sock._fd, ptr, len, NULL); }
 
 size_t _z_tcp_read_exact(_z_sys_net_socket_t sock, uint8_t *ptr, size_t len) {
     size_t n = 0;
@@ -299,11 +310,18 @@ size_t _z_tcp_read_exact(_z_sys_net_socket_t sock, uint8_t *ptr, size_t len) {
             }
             continue;
         }
-        size_t rb = zp_recv_now(sock._fd, pos, len - n);
+        bool failed = false;
+        size_t rb = zp_recv_now(sock._fd, pos, len - n, &failed);
         if (rb == 0) {
             return 0;
         }
         if (rb == SIZE_MAX) {
+            if (failed) {
+                /* The socket is ready but every recv fails (lwIP keeps
+                 * reporting a reset connection): it is gone, like a
+                 * closed one. Waiting again would spin here for good. */
+                return 0;
+            }
             continue;
         }
         if (n == 0) {

@@ -12,6 +12,11 @@ Ruby API for what both have.
   handed to zenoh-pico's failure path at once. `Session#reconnecting?`,
   `AUTO_RECONNECT`; a put while reconnecting is dropped. `rake
   test_reconnect` (docker).
+- The handshake read (`_z_tcp_read_exact`) ends on a failed socket (a reset)
+  as on a closed one. On ESP-IDF, lwIP reports the reset on every later
+  recv, and the read waited again for good: a reconnection that reached a
+  port proxy which accepts and then resets while the router restarts (Docker
+  Desktop) hung inside `poll` and never came back.
 
 ## 0.4.0
 
