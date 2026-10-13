@@ -4,6 +4,15 @@ All notable changes to picoruby-asterism-zenoh. From 0.4.0 it carries the
 same version number as the CRuby binding (asterism-zenoh), and the same
 Ruby API for what both have.
 
+## Unreleased
+
+- zenoh-pico's reconnection on by default (`Z_FEATURE_AUTO_RECONNECT=1` in
+  include/zenoh_generic_config.h): a client session whose router goes away
+  is opened again and its declarations are sent again; a closed socket is
+  handed to zenoh-pico's failure path at once. `Session#reconnecting?`,
+  `AUTO_RECONNECT`; a put while reconnecting is dropped. `rake
+  test_reconnect` (docker).
+
 ## 0.4.0
 
 The first step of the API review toward 1.0 (the asterism gem's

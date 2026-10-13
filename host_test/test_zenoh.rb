@@ -46,6 +46,7 @@ check(Z::CONNECT_TIMEOUT_MS == 3000, "CONNECT_TIMEOUT_MS")
 check(Z::SEND_TIMEOUT_MS == 3000, "SEND_TIMEOUT_MS")
 check(Z::PEER == true, "PEER")
 check(Z::MAX_PEERS == 3, "MAX_PEERS #{Z::MAX_PEERS}")
+check(Z::AUTO_RECONNECT == true, "AUTO_RECONNECT (the default of zenoh_generic_config.h)")
 check(!Object.const_defined?(:Zenoh), "no top-level Zenoh")
 check(Z::VERSION == "0.4.0", "VERSION #{Z::VERSION}")
 check(Z::BACKEND == :zenoh_pico && Z::BACKEND_VERSION == Z::PICO_VERSION, "BACKEND")
@@ -70,6 +71,7 @@ check(Time.now - t < Z::CONNECT_TIMEOUT_MS / 1000.0 + 2, "open gives up within t
 s = Z::Session.open("tcp/127.0.0.1:#{port}", mode: :peer)
 check(s.poll, "poll on an open session")
 check(!s.closed?, "not closed")
+check(s.reconnecting? == false, "a peer session never reconnects (zenoh-pico reconnects clients only)")
 check(s.connection_count == 1, "connection_count #{s.connection_count}")
 raises(Asterism::DeprecationError, "peers raises when deprecations raise") { s.peers }
 Asterism.deprecations = :warn

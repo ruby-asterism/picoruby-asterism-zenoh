@@ -122,6 +122,52 @@ task test: :build do
   end
 end
 
+desc "Reconnection over a router that restarts (needs docker and the zenohd image of ZENOH_PICO_PIN's release)"
+task test_reconnect: :build do
+  bin = mruby_bin
+  port = free_port
+  image = ENV["ZENOHD_IMAGE"] || "eclipse/zenoh:#{zenoh_pico_pin["tag"]}"
+  name = "pico-reconnect-#{Process.pid}"
+  sh "docker run -d --rm --name #{name} -p 127.0.0.1:#{port}:7447 #{image} " \
+     "--no-multicast-scouting -l tcp/0.0.0.0:7447 > /dev/null"
+  locator = "tcp/127.0.0.1:#{port}"
+  a = nil
+  begin
+    sleep 1.5
+    a = IO.popen([bin, File.join(ROOT, "host_test", "reconnect_a.rb"), locator], err: [:child, :out])
+    line = Timeout.timeout(10) { a.gets }
+    abort "reconnect_a did not start: #{line.inspect}" unless line&.start_with?("ready")
+    puts "a: #{line}"
+    t = Time.now
+    sh "docker restart -t 1 #{name} > /dev/null"
+    puts "router restarted in #{(Time.now - t).round(2)} s"
+    out = []
+    Timeout.timeout(30) do
+      while (l = a.gets)
+        puts "a: #{l}"
+        out << l
+        break if l.start_with?("back", "closed")
+      end
+    end
+    abort "no reconnection" unless out.last.to_s.start_with?("back")
+    ok = system(bin, File.join(ROOT, "host_test", "reconnect_b.rb"), locator)
+    rest = Timeout.timeout(15) { a.read }
+    puts rest.lines.map { "a: #{_1}" }.join
+    abort "the declarations did not come back" unless ok && rest.include?("summary 2 1 token-open")
+    puts "reconnection: ok"
+  ensure
+    if a
+      begin
+        Process.kill("TERM", a.pid)
+      rescue Errno::ESRCH
+        nil
+      end
+      a.close
+    end
+    system("docker rm -f #{name} > /dev/null 2>&1")
+  end
+end
+
 desc "Remove the host build (vendor/ stays)"
 task :clean do
   FileUtils.rm_rf(File.join(ROOT, "tmp"))

@@ -16,8 +16,14 @@
  *   from the polled runtime too (a non-blocking accept, retried every
  *   second), so peer mode needs no task either.
  * - Publication, subscription, query (get), queryable and liveliness.
- * - No automatic reconnection: a lost router closes the session, and the
- *   application decides whether to open a new one.
+ * - Automatic reconnection of a client session (Z_FEATURE_AUTO_RECONNECT):
+ *   a lost router does not close the session; zenoh-pico opens the
+ *   connection again (one try a second, from the poll) and declares again
+ *   what was declared (src/zenoh.c). Its cost: a copy of every declaration
+ *   on the session, from zenoh-pico's allocator (PSRAM on ESP-IDF), and about
+ *   2.5 KB of code (ESP32-P4: +2552 bytes of flash, no static internal RAM).
+ *   -DZ_FEATURE_AUTO_RECONNECT=0 builds without
+ *   it (a lost router then closes the session).
  *
  * Every value can be overridden from the build (e.g. -DZ_FRAG_MAX_SIZE=2048).
  *
@@ -174,7 +180,7 @@
 #define Z_FEATURE_UNICAST_PEER 1
 #endif
 #ifndef Z_FEATURE_AUTO_RECONNECT
-#define Z_FEATURE_AUTO_RECONNECT 0
+#define Z_FEATURE_AUTO_RECONNECT 1
 #endif
 #ifndef Z_FEATURE_MULTICAST_DECLARATIONS
 #define Z_FEATURE_MULTICAST_DECLARATIONS 0

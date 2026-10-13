@@ -19,12 +19,25 @@
  * Losing the connection: zenoh-pico's client read path does not tell a closed
  * connection from an idle one, so the gem asks its TCP link
  * (include/picoruby_zenoh_link.h) after every poll and put. When the router
- * has closed the connection, the socket failed, or a send ran out of time,
- * the session is closed here: poll returns false, closed? is true and put
- * raises Asterism::Zenoh::Error. A peer session that only connects (no listener) is
- * closed the same way once it has no peer left; a listening peer session
- * stays open while peers come and go. There is no reconnection; the
- * application opens a new session.
+ * has closed the connection, the socket failed, or a send ran out of time:
+ * - With zenoh-pico's reconnection (Z_FEATURE_AUTO_RECONNECT, the default
+ *   of include/zenoh_generic_config.h) a client session is not closed: the
+ *   gem hands the lost link to zenoh-pico's own failure path at once (as if
+ *   the lease had expired), and zenoh-pico opens the connection again (one
+ *   try a second, each in a poll) and declares again everything that was
+ *   declared on the session (subscribers, queryables, liveliness tokens and
+ *   watches). The Ruby objects stay valid. Meanwhile reconnecting? is
+ *   true, poll returns true, put drops the value (as a router that is away
+ *   would), get and liveliness_get reach nobody (no reply comes; they end
+ *   at their time limit), and a new declaration raises
+ *   Asterism::Zenoh::Error (not ClosedError: the session stays). A
+ *   liveliness watch reports every token as gone when the link is lost and
+ *   as there again when the router tells it after the reconnection.
+ * - Without it (a build with Z_FEATURE_AUTO_RECONNECT=0), the session is
+ *   closed here: poll returns false, closed? is true and put raises
+ *   Asterism::Zenoh::ClosedError; the application opens a new session.
+ * A peer session that only connects (no listener) is closed once it has no
+ * peer left; a listening peer session stays open while peers come and go.
  *
  * Lifetime: closing is optional. The Ruby objects close their zenoh-pico
  * counterparts when they are freed, in any order (an interpreter shutdown
@@ -53,6 +66,10 @@
 #include <zenoh-pico/net/session.h>
 
 #include "picoruby_zenoh_link.h"
+
+#if Z_FEATURE_AUTO_RECONNECT == 1
+#include <zenoh-pico/transport/unicast/lease.h>
+#endif
 
 #define ZRB_DEFAULT_DEPTH 16
 /* The queue of a get (and a liveliness get) is allocated in full when the
@@ -946,8 +963,15 @@ static bool zrb_session_check_link(zrb_session *z) {
     _z_session_t *s = _Z_RC_IN_VAL(z_loan(z->session));
     /* A router that stays silent past the lease: zenoh-pico clears the
      * transport (type NONE, link freed) but does not mark the session
-     * closed. Treat it like a lost connection. */
+     * closed. With reconnection the transport's state says RECONNECTING
+     * while zenoh-pico tries again; otherwise treat it like a lost
+     * connection. */
     if (s->_tp._type == _Z_TRANSPORT_NONE) {
+#if Z_FEATURE_AUTO_RECONNECT == 1
+        if (!z->peer && s->_tp._transport._unicast._common._state == _Z_TRANSPORT_STATE_RECONNECTING) {
+            return false;
+        }
+#endif
         zrb_session_shutdown(z);
         return true;
     }
@@ -972,10 +996,37 @@ static bool zrb_session_check_link(zrb_session *z) {
         return false;
     }
     if (zp_tcp_socket_closed(_z_link_get_socket(link))) {
+#if Z_FEATURE_AUTO_RECONNECT == 1
+        /* zenoh-pico's own failure path (the lease task's when the router
+         * goes silent): closes the transport and starts the task that opens
+         * it again. Its result tells the task that called it what to do;
+         * called from here no task waits for it, and the transport's tasks
+         * suspend themselves on their next turn. */
+        (void)_zp_unicast_failed_result(&s->_tp._transport._unicast, &s->_runtime);
+        if (s->_tp._type == _Z_TRANSPORT_NONE &&
+            s->_tp._transport._unicast._common._state == _Z_TRANSPORT_STATE_RECONNECTING) {
+            return false;
+        }
+#endif
         zrb_session_shutdown(z);
         return true;
     }
     return false;
+}
+
+/* True while zenoh-pico is opening a lost connection again (client mode,
+ * Z_FEATURE_AUTO_RECONNECT). */
+static bool zrb_session_reconnecting(zrb_session *z) {
+#if Z_FEATURE_AUTO_RECONNECT == 1
+    if (!z->open || z->peer || zrb_session_check_link(z)) {
+        return false;
+    }
+    _z_session_t *s = _Z_RC_IN_VAL(z_loan(z->session));
+    return s->_tp._type == _Z_TRANSPORT_NONE;
+#else
+    (void)z;
+    return false;
+#endif
 }
 
 static zrb_session *zrb_session_get_open(mrb_state *mrb, mrb_value self) {
@@ -1094,6 +1145,9 @@ static mrb_value zrb_session_put(mrb_state *mrb, mrb_value self) {
     z_result_t ret = z_put(z_loan(z->session), z_loan(ke), z_move(bytes), &opts);
     if (zrb_session_check_link(z)) {
         zrb_raise_code(mrb, zrb_closed_class(mrb), (int)ret, "put failed: the connection is lost (%d)", (int)ret);
+    }
+    if (ret != Z_OK && zrb_session_reconnecting(z)) {
+        return mrb_nil_value(); /* nobody to send it to until the router is back */
     }
     if (ret != Z_OK) {
         zrb_raise_code(mrb, zrb_error_class(mrb), (int)ret, "put failed (%d)", (int)ret);
@@ -1317,7 +1371,8 @@ static mrb_value zrb_session_get_m(mrb_state *mrb, mrb_value self) {
         zrb_raise_code(mrb, zrb_closed_class(mrb), (int)ret, "get failed: the connection is lost (%d)", (int)ret);
     }
     if (ret != Z_OK) {
-        zrb_raise_code(mrb, zrb_error_class(mrb), (int)ret, "get failed (%d)", (int)ret);
+        zrb_raise_code(mrb, zrb_error_class(mrb), (int)ret, "get failed%s (%d)",
+                       zrb_session_reconnecting(z) ? ": reconnecting" : "", (int)ret);
     }
     zrb_hold_session(mrb, obj, self, key);
     return obj;
@@ -1376,7 +1431,8 @@ static mrb_value zrb_session_liveliness_get(mrb_state *mrb, mrb_value self) {
         zrb_raise_code(mrb, zrb_closed_class(mrb), (int)ret, "liveliness_get failed: the connection is lost (%d)", (int)ret);
     }
     if (ret != Z_OK) {
-        zrb_raise_code(mrb, zrb_error_class(mrb), (int)ret, "liveliness_get failed (%d)", (int)ret);
+        zrb_raise_code(mrb, zrb_error_class(mrb), (int)ret, "liveliness_get failed%s (%d)",
+                       zrb_session_reconnecting(z) ? ": reconnecting" : "", (int)ret);
     }
     zrb_hold_session(mrb, obj, self, key);
     return obj;
@@ -1408,6 +1464,12 @@ static mrb_value zrb_session_poll(mrb_state *mrb, mrb_value self) {
 
 static mrb_value zrb_session_closed_p(mrb_state *mrb, mrb_value self) {
     return mrb_bool_value(zrb_session_check_link(zrb_session_get(mrb, self)));
+}
+
+/* session.reconnecting? -> true while the connection is lost and
+ * zenoh-pico opens it again (see the top of this file). */
+static mrb_value zrb_session_reconnecting_p(mrb_state *mrb, mrb_value self) {
+    return mrb_bool_value(zrb_session_reconnecting(zrb_session_get(mrb, self)));
 }
 
 static mrb_value zrb_session_close(mrb_state *mrb, mrb_value self) {
@@ -1459,6 +1521,8 @@ void mrb_picoruby_asterism_zenoh_gem_init(mrb_state *mrb) {
     mrb_define_const(mrb, mod, "SEND_TIMEOUT_MS", mrb_fixnum_value(PICORUBY_ZENOH_SEND_TIMEOUT_MS));
     mrb_define_const(mrb, mod, "PEER", mrb_bool_value(Z_FEATURE_UNICAST_PEER == 1));
     mrb_define_const(mrb, mod, "MAX_PEERS", mrb_fixnum_value(Z_LISTEN_MAX_CONNECTION_NB));
+    /* Whether a client session opens a lost connection again by itself. */
+    mrb_define_const(mrb, mod, "AUTO_RECONNECT", mrb_bool_value(Z_FEATURE_AUTO_RECONNECT == 1));
     /* Queue depths: the default of subscribe and queryable; of get and
      * liveliness_get; of liveliness_watch; and the largest accepted. */
     mrb_define_const(mrb, mod, "DEFAULT_DEPTH", mrb_fixnum_value(ZRB_DEFAULT_DEPTH));
@@ -1481,6 +1545,7 @@ void mrb_picoruby_asterism_zenoh_gem_init(mrb_state *mrb) {
     mrb_define_method(mrb, ses, "connection_count", zrb_session_connection_count, MRB_ARGS_NONE());
     mrb_define_method(mrb, ses, "zid", zrb_session_zid, MRB_ARGS_NONE());
     mrb_define_method(mrb, ses, "closed?", zrb_session_closed_p, MRB_ARGS_NONE());
+    mrb_define_method(mrb, ses, "reconnecting?", zrb_session_reconnecting_p, MRB_ARGS_NONE());
     mrb_define_method(mrb, ses, "close", zrb_session_close, MRB_ARGS_NONE());
 
     /* Subscriber and LivelinessWatch share one C structure. */

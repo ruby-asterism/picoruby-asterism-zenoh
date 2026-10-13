@@ -129,9 +129,27 @@ can no longer carry it:
   raises after the time limit. A half-sent message would corrupt the stream,
   so the connection is shut down rather than retried.
 
-From then on `poll` returns `false`, `closed?` is `true` and `put` raises
-`Asterism::Zenoh::ClosedError` (an `Asterism::Zenoh::Error`). Values already received can still be taken from the
-subscribers. There is no automatic reconnection: to go on, the application
+A client session (built with `Z_FEATURE_AUTO_RECONNECT`, the default of
+`include/zenoh_generic_config.h`) is not closed by any of these: zenoh-pico
+opens the connection again by itself (one try a second, from `poll`) and
+declares again everything that was declared on the session (subscribers,
+queryables, liveliness tokens and watches), so the Ruby objects stay valid.
+Meanwhile `reconnecting?` is `true` and `poll` returns `true`; `put` drops
+the value (nobody to send it to), `get` and `liveliness_get` reach nobody
+(they end at their time limit), and a new declaration raises
+`Asterism::Zenoh::Error`. A liveliness watch sees every token go away when
+the link is lost and come back after the reconnection. Measured against
+zenohd 1.10.1 restarted with `docker restart` (`rake test_reconnect`): the
+session was back about 1 s after the router. `AUTO_RECONNECT` says whether
+the build has it; the cost is a copy of each declaration from zenoh-pico's
+allocator (PSRAM on ESP-IDF) and about 2.5 KB of code (an ESP32-P4
+build: +2552 bytes of flash, the same static internal RAM).
+
+A peer session, and a client session built with
+`-DZ_FEATURE_AUTO_RECONNECT=0`, is closed instead: from then on `poll`
+returns `false`, `closed?` is `true` and `put` raises
+`Asterism::Zenoh::ClosedError` (an `Asterism::Zenoh::Error`). Values already
+received can still be taken from the subscribers. To go on, the application
 opens a new session (`Asterism::Zenoh::Session.open` again).
 
 ## Design
