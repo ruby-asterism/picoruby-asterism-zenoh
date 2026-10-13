@@ -16,7 +16,8 @@
 #   zenoh-pico core and the gem are compiled here with the platform types of
 #   include/zenoh_espidf_platform.h, which need no ESP-IDF headers. The
 #   platform files that do (ports/esp32/: system with a PSRAM allocator, the
-#   TCP link; and zenoh-pico's src/system/socket/esp32.c) are left to the
+#   TCP link, the TLS stream over Mbed TLS; and zenoh-pico's
+#   src/system/socket/esp32.c) are left to the
 #   ESP-IDF component, like the ports/esp32 sources of other PicoRuby gems.
 #   They must be compiled with the same defines and include paths; see
 #   README.md (Building).
@@ -99,6 +100,14 @@ MRuby::Gem::Specification.new('picoruby-asterism-zenoh') do |spec|
     link/transport/upper/serial_protocol.c
     link/transport/upper/tls_stream.c
   ].map { |f| "#{zp_dir}/src/#{f}" }
+  # ESP-IDF builds TLS links (include/zenoh_generic_config.h) with this gem's
+  # own: the link src/zp_tls_link.c (compiled here, like every src/*.c) and
+  # the stream ports/esp32/zp_tls_esp32.c (Mbed TLS, compiled by the ESP-IDF
+  # component). zenoh-pico's two would block in a polled session, and its
+  # stream needs the Mbed TLS headers this compiler does not have.
+  unless posix
+    srcs -= %w[link/unicast/tls.c link/transport/upper/tls_stream.c].map { |f| "#{zp_dir}/src/#{f}" }
+  end
   # system/unix/network.c (socket helpers) is replaced by this gem's
   # src/zp_network_posix.c (EINTR-safe wait on the peer sockets).
   if posix

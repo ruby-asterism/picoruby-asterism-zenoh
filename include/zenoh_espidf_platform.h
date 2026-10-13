@@ -36,7 +36,9 @@
  * The layout matches espidf.h for this gem's configuration (single-threaded,
  * TCP only, no serial): a socket is an lwIP file descriptor and an endpoint
  * the getaddrinfo() result. Keep it in step with that header when zenoh-pico
- * is updated.
+ * is updated. Unlike espidf.h, a socket also has the pointer to its TLS
+ * stream when TLS links are built (zenoh-pico's unix.h has the same field;
+ * ports/esp32/zp_tls_esp32.c is the ESP-IDF TLS link).
  */
 #ifndef PICORUBY_ZENOH_ESPIDF_PLATFORM_H
 #define PICORUBY_ZENOH_ESPIDF_PLATFORM_H
@@ -52,9 +54,8 @@
 #if Z_FEATURE_MULTI_THREAD == 1
 #error "picoruby-asterism-zenoh: the ESP-IDF platform header supports the single-threaded build only"
 #endif
-#if Z_FEATURE_LINK_SERIAL == 1 || Z_FEATURE_LINK_BLUETOOTH == 1 || Z_FEATURE_RAWETH_TRANSPORT == 1 || \
-    Z_FEATURE_LINK_TLS == 1
-#error "picoruby-asterism-zenoh: the ESP-IDF platform header supports socket links (TCP/UDP) only"
+#if Z_FEATURE_LINK_SERIAL == 1 || Z_FEATURE_LINK_BLUETOOTH == 1 || Z_FEATURE_RAWETH_TRANSPORT == 1
+#error "picoruby-asterism-zenoh: the ESP-IDF platform header supports socket links (TCP/UDP/TLS) only"
 #endif
 
 #ifdef __cplusplus
@@ -72,6 +73,9 @@ typedef struct {
         int _fd;
 #endif
     };
+#if Z_FEATURE_LINK_TLS == 1
+    void *_tls_sock;  // the TLS stream (_z_tls_socket_t) of a TLS link, as on Unix
+#endif
 } _z_sys_net_socket_t;
 
 typedef struct {

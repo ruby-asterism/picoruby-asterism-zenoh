@@ -54,7 +54,12 @@ check(Z::PEER_SUPPORTED == Z::PEER && Z::DEFAULT_TIMEOUT == 2.0, "PEER_SUPPORTED
 check(Z::Error.superclass == Asterism::Error && Asterism::Error.superclass == StandardError, "error tree")
 check(Z::ClosedError.superclass == Z::Error, "ClosedError < Zenoh::Error")
 check(Asterism::DeprecationError.superclass == Asterism::Error, "DeprecationError < Asterism::Error")
-raises(ArgumentError, "config: on the boards") { Z::Session.open("tcp/127.0.0.1:1", config: {}) }
+raises(ArgumentError, "config: other than TLS on the boards") { Z::Session.open("tcp/127.0.0.1:1", config: { "mode" => "peer" }) }
+raises(ArgumentError, "config: as a String on the boards") { Z::Session.open("tcp/127.0.0.1:1", config: "{}") }
+check(Z::TLS == false, "TLS is off on POSIX")
+raises(Z::Error, "TLS settings without TLS built in") do
+  Z::Session.open("tls/127.0.0.1:1", config: { "transport/link/tls/enable_mtls" => true })
+end
 raises(ArgumentError, "connect_timeout: on the boards") { Z::Session.open("tcp/127.0.0.1:1", connect_timeout: 1) }
 raises(ArgumentError, "open(nil) in client mode") { Z::Session.open(nil) }
 raises(ArgumentError, "unknown mode") { Z::Session.open("tcp/127.0.0.1:1", mode: :router) }

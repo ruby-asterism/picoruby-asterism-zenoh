@@ -10,6 +10,10 @@ under the Apache License, Version 2.0 (LICENSE-APACHE):
 - ports/esp32/zp_tcp_esp32.c  (from src/link/transport/tcp/tcp_esp32.c)
 - include/zenoh_espidf_platform.h
                               (from include/zenoh-pico/system/platform/espidf.h)
+- include/zenoh-pico/link/transport/tls_stream.h
+                              (from the file of the same name)
+- src/zp_tls_link.c           (from src/link/unicast/tls.c)
+- ports/esp32/zp_tls_esp32.c  (from src/link/transport/upper/tls_stream.c)
 
 Each of them keeps zenoh-pico's copyright notice at its top and says how it
 was changed.

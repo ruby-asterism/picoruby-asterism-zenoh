@@ -1045,16 +1045,71 @@ static void zrb_hold_session(mrb_state *mrb, mrb_value obj, mrb_value session, c
     }
 }
 
-/* Asterism::Zenoh::Session.open(locator = nil, mode: :client, listen: nil) -> Session
+#if Z_FEATURE_LINK_TLS == 1
+/* The TLS settings Session.open takes (tls:), by the name after
+ * "transport/link/tls/" in a zenoh configuration. */
+static const struct {
+    const char *name;
+    uint8_t key;
+} zrb_tls_keys[] = {
+    {"root_ca_certificate_base64", Z_CONFIG_TLS_ROOT_CA_CERTIFICATE_BASE64_KEY},
+    {"connect_certificate_base64", Z_CONFIG_TLS_CONNECT_CERTIFICATE_BASE64_KEY},
+    {"connect_private_key_base64", Z_CONFIG_TLS_CONNECT_PRIVATE_KEY_BASE64_KEY},
+    {"enable_mtls", Z_CONFIG_TLS_ENABLE_MTLS_KEY},
+    {"verify_name_on_connect", Z_CONFIG_TLS_VERIFY_NAME_ON_CONNECT_KEY},
+};
+#endif
+
+/* tls: [name, value, name, value, ...] (Strings; mrblib/pico.rb makes it
+ * from config:) into the session's configuration. Raises ArgumentError for
+ * a name it does not know, Error when TLS is not built in. */
+static void zrb_config_tls(mrb_state *mrb, z_owned_config_t *config, mrb_value tls) {
+    if (mrb_nil_p(tls) || mrb_undef_p(tls)) {
+        return;
+    }
+#if Z_FEATURE_LINK_TLS == 1
+    if (!mrb_array_p(tls) || RARRAY_LEN(tls) % 2 != 0) {
+        z_drop(z_move(*config));
+        mrb_raise(mrb, E_ARGUMENT_ERROR, "tls: must be [name, value, ...]");
+    }
+    for (mrb_int i = 0; i < RARRAY_LEN(tls); i += 2) {
+        mrb_value name = mrb_ary_ref(mrb, tls, i);
+        mrb_value value = mrb_ary_ref(mrb, tls, i + 1);
+        if (!mrb_string_p(name) || !mrb_string_p(value)) {
+            z_drop(z_move(*config));
+            mrb_raise(mrb, E_ARGUMENT_ERROR, "tls: names and values must be Strings");
+        }
+        const char *n = mrb_string_value_cstr(mrb, &name);
+        size_t k = 0;
+        while (k < sizeof(zrb_tls_keys) / sizeof(zrb_tls_keys[0]) && strcmp(zrb_tls_keys[k].name, n) != 0) {
+            k++;
+        }
+        if (k == sizeof(zrb_tls_keys) / sizeof(zrb_tls_keys[0])) {
+            z_drop(z_move(*config));
+            mrb_raisef(mrb, E_ARGUMENT_ERROR, "tls: unknown setting %s", n);
+        }
+        if (zp_config_insert(z_loan_mut(*config), zrb_tls_keys[k].key, mrb_string_value_cstr(mrb, &value)) != Z_OK) {
+            z_drop(z_move(*config));
+            mrb_raise(mrb, zrb_error_class(mrb), "cannot store the TLS settings");
+        }
+    }
+#else
+    z_drop(z_move(*config));
+    mrb_raise(mrb, zrb_error_class(mrb), "TLS is not built in on this platform (Z_FEATURE_LINK_TLS)");
+#endif
+}
+
+/* Asterism::Zenoh::Session.open(locator = nil, mode: :client, listen: nil, tls: nil) -> Session
  * - client: connects to the router at locator.
  * - peer: connects to the peer at locator (if given) and/or listens on
  *   listen (e.g. "tcp/0.0.0.0:7447"). At least one of them is needed.
+ * - tls: the TLS settings of a tls/ locator (see zrb_config_tls).
  * Raises Asterism::Zenoh::Error when the session cannot be opened. */
 static mrb_value zrb_session_s_open(mrb_state *mrb, mrb_value klass) {
     mrb_value locator_v = mrb_nil_value();
-    mrb_sym kw_names[2] = {mrb_intern_lit(mrb, "mode"), mrb_intern_lit(mrb, "listen")};
-    mrb_value kw_values[2];
-    mrb_kwargs kwargs = {2, 0, kw_names, kw_values, NULL};
+    mrb_sym kw_names[3] = {mrb_intern_lit(mrb, "mode"), mrb_intern_lit(mrb, "listen"), mrb_intern_lit(mrb, "tls")};
+    mrb_value kw_values[3];
+    mrb_kwargs kwargs = {3, 0, kw_names, kw_values, NULL};
     mrb_get_args(mrb, "|o:", &locator_v, &kwargs);
 
     bool peer = false;
@@ -1104,6 +1159,7 @@ static mrb_value zrb_session_s_open(mrb_state *mrb, mrb_value klass) {
         z_drop(z_move(config));
         mrb_raise(mrb, zrb_error_class(mrb), "invalid locator");
     }
+    zrb_config_tls(mrb, &config, kw_values[2]);
     z_result_t ret = z_open(&z->session, z_move(config), NULL);
     if (ret != Z_OK) {
         zrb_raise_code(mrb, zrb_error_class(mrb), (int)ret, "cannot open a session to %s (%d)",
@@ -1523,6 +1579,7 @@ void mrb_picoruby_asterism_zenoh_gem_init(mrb_state *mrb) {
     mrb_define_const(mrb, mod, "MAX_PEERS", mrb_fixnum_value(Z_LISTEN_MAX_CONNECTION_NB));
     /* Whether a client session opens a lost connection again by itself. */
     mrb_define_const(mrb, mod, "AUTO_RECONNECT", mrb_bool_value(Z_FEATURE_AUTO_RECONNECT == 1));
+    mrb_define_const(mrb, mod, "TLS", mrb_bool_value(Z_FEATURE_LINK_TLS == 1));
     /* Queue depths: the default of subscribe and queryable; of get and
      * liveliness_get; of liveliness_watch; and the largest accepted. */
     mrb_define_const(mrb, mod, "DEFAULT_DEPTH", mrb_fixnum_value(ZRB_DEFAULT_DEPTH));
@@ -1533,7 +1590,7 @@ void mrb_picoruby_asterism_zenoh_gem_init(mrb_state *mrb) {
     struct RClass *ses = mrb_define_class_under(mrb, mod, "Session", mrb->object_class);
     MRB_SET_INSTANCE_TT(ses, MRB_TT_CDATA);
     mrb_undef_class_method(mrb, ses, "new");
-    mrb_define_class_method(mrb, ses, "open", zrb_session_s_open, MRB_ARGS_OPT(1) | MRB_ARGS_KEY(2, 0));
+    mrb_define_class_method(mrb, ses, "open", zrb_session_s_open, MRB_ARGS_OPT(1) | MRB_ARGS_KEY(3, 0));
     mrb_define_method(mrb, ses, "put", zrb_session_put, MRB_ARGS_REQ(2) | MRB_ARGS_KEY(1, 0));
     mrb_define_method(mrb, ses, "subscribe", zrb_session_subscribe, MRB_ARGS_ARG(1, 1));
     mrb_define_method(mrb, ses, "get", zrb_session_get_m, MRB_ARGS_ARG(1, 3) | MRB_ARGS_KEY(4, 0));

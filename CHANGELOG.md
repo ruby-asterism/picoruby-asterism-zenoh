@@ -4,6 +4,16 @@ All notable changes to picoruby-asterism-zenoh. From 0.4.0 it carries the
 same version number as the CRuby binding (asterism-zenoh), and the same
 Ruby API for what both have.
 
+## Unreleased
+
+- TLS links on ESP-IDF (`tls/<host>:<port>`, mutual TLS): the gem's own
+  link (`src/zp_tls_link.c`) and stream over the platform's Mbed TLS
+  (`ports/esp32/zp_tls_esp32.c`), with the TCP link's time limits and a
+  failure that ends the read instead of looking like "nothing yet".
+  `Session.open(locator, config: {...})` takes the TLS settings (the zenoh
+  names of the CRuby binding, base64 certificates). `Asterism::Zenoh::TLS`.
+  zenoh-pico's own TLS files are not compiled on ESP-IDF.
+
 ## 0.4.1
 
 - zenoh-pico's reconnection on by default (`Z_FEATURE_AUTO_RECONNECT=1` in

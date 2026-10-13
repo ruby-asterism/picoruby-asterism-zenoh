@@ -11,7 +11,8 @@
  *   application drives the session with Asterism::Zenoh::Session#poll, which runs
  *   zp_spin_once() a bounded number of times.
  * - Client mode, or peer mode (connect to peers and/or listen for them),
- *   over TCP unicast only. Serial, TLS, WebSocket, Bluetooth, raw ethernet,
+ *   over TCP unicast, and on ESP-IDF also TLS (a client connecting to a
+ *   router, with mutual TLS). Serial, WebSocket, Bluetooth, raw ethernet,
  *   UDP and multicast scouting are compiled out. A listening peer accepts
  *   from the polled runtime too (a non-blocking accept, retried every
  *   second), so peer mode needs no task either.
@@ -125,8 +126,17 @@
 #ifndef Z_FEATURE_LINK_SERIAL_USB
 #define Z_FEATURE_LINK_SERIAL_USB 0
 #endif
+/* TLS links (tls/<host>:<port>, Mbed TLS) on ESP-IDF, where Mbed TLS is
+ * part of the platform: ports/esp32/zp_tls_esp32.c is the stream and
+ * src/zp_tls_link.c the link (zenoh-pico's own two block and are not
+ * compiled there). Elsewhere off (zenoh-pico's own TLS needs an Mbed TLS
+ * the host build does not have). */
 #ifndef Z_FEATURE_LINK_TLS
+#if defined(ZENOH_ESPIDF)
+#define Z_FEATURE_LINK_TLS 1
+#else
 #define Z_FEATURE_LINK_TLS 0
+#endif
 #endif
 #ifndef Z_FEATURE_SCOUTING
 #define Z_FEATURE_SCOUTING 0

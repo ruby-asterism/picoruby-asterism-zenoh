@@ -41,7 +41,8 @@ end
 | `Asterism::Zenoh::Session.open(locator)` | `Session` | Client mode, connects to the router at `locator` (`tcp/host:port`). Raises `Asterism::Zenoh::Error` when the router cannot be reached. Blocks while connecting (a few seconds at most). |
 | `Asterism::Zenoh::Session.open(locator, mode: :peer)` | `Session` | Peer mode without a router: connects to the peer at `locator`. |
 | `Asterism::Zenoh::Session.open(nil, mode: :peer, listen: "tcp/0.0.0.0:7447")` | `Session` | Peer mode, listening for peers (a `locator` may be given too). New peers are accepted by `poll` (checked about once a second). |
-| `Asterism::Zenoh::Session.open(...) { \|s\| }` | the block's value | Closes the session after the block (also on an exception). The CRuby binding's other keywords (`config:`, `config_file:`, `scouting:`, `timestamping:`, `connect_timeout:`) raise `ArgumentError` here. |
+| `Asterism::Zenoh::Session.open("tls/host:port", config: {...})` | `Session` | Client mode over TLS (ESP-IDF builds; `Asterism::Zenoh::TLS`). `config:` takes the TLS settings only, under their zenoh names: `transport/link/tls/root_ca_certificate_base64`, `connect_certificate_base64`, `connect_private_key_base64` (base64 of the PEM), `enable_mtls`, `verify_name_on_connect` -- the Hash `Asterism::Credentials#zenoh_config` makes from a console's `.tar`. See "TLS" below. |
+| `Asterism::Zenoh::Session.open(...) { \|s\| }` | the block's value | Closes the session after the block (also on an exception). The CRuby binding's other keywords (`config_file:`, `scouting:`, `timestamping:`, `connect_timeout:`) and other `config:` keys raise `ArgumentError` here. |
 | `session.zid` | String | This session's Zenoh ID in hex (what other nodes see as its ID; rmw_zenoh puts it in its liveliness keys). |
 | `session.connection_count` | Integer | Connected peers (peer mode), or 1 for the router of a client session; 0 once closed. (`peers` is its deprecated name.) |
 | `session.put(key, payload, attachment: nil)` | `nil` | `payload` is a String (bytes, sent as is); `attachment:` a String sent as the sample's attachment (Zenoh's per-sample metadata, which ROS 2's rmw_zenoh requires), or nil for none. `ArgumentError` on a bad key, `Asterism::Zenoh::ClosedError` when the session is closed or the connection is found lost (see below), `Asterism::Zenoh::Error` when the put fails. Waits at most `SEND_TIMEOUT_MS` for room to send. |
@@ -152,6 +153,37 @@ returns `false`, `closed?` is `true` and `put` raises
 received can still be taken from the subscribers. To go on, the application
 opens a new session (`Asterism::Zenoh::Session.open` again).
 
+## TLS
+
+On ESP-IDF the gem builds TLS links (`tls/<host>:<port>`, a client of a
+router, with mutual TLS when `enable_mtls` is given) on the platform's Mbed
+TLS. zenoh-pico's own TLS link and stream are not compiled there: its stream
+blocks without a time limit (a polled session would hang in `poll`) and its
+header needs the Mbed TLS headers in the core. In their place:
+
+- `include/zenoh-pico/link/transport/tls_stream.h`: the TLS stream as the
+  core sees it, with the Mbed TLS state hidden (found before zenoh-pico's
+  own header; other platforms get zenoh-pico's through `#include_next`).
+- `src/zp_tls_link.c`: the link, with the handshake read of the TCP link
+  (one socket timeout before the first byte, then a time limit; a failed
+  connection ends it).
+- `ports/esp32/zp_tls_esp32.c`: the stream. The socket I/O under Mbed TLS
+  never blocks; the TLS handshake (`PICORUBY_ZENOH_TLS_HANDSHAKE_TIMEOUT_MS`,
+  10 s), the handshake read and a send wait on `select` up to their limits;
+  the polled read never waits. Every Mbed TLS error other than "want
+  read / want write" closes the read and shuts the socket down, so the
+  session takes zenoh-pico's failure path (and reconnects) instead of
+  retrying it. Certificates and the key come as base64 only; a TLS listener
+  is refused. The handshake is logged once per connection with its duration
+  and the lowest internal RAM seen between its steps.
+
+The router may ask for TLS 1.3 (zenohd 1.10.1 does, with mutual TLS): the
+ESP-IDF project needs `CONFIG_MBEDTLS_SSL_PROTO_TLS1_3` and must call
+`psa_crypto_init()` once (the gem calls it before each handshake as well).
+Where Mbed TLS allocates is the project's choice
+(`CONFIG_MBEDTLS_*_MEM_ALLOC`); the gem's own context comes from its PSRAM
+allocator. On POSIX hosts TLS stays off (`Asterism::Zenoh::TLS` is false).
+
 ## Design
 
 - **Single-threaded, polled.** zenoh-pico is built with
@@ -184,8 +216,8 @@ opens a new session (`Asterism::Zenoh::Session.open` again).
   or `q.finish`). A `Get` is owned jointly by its Ruby object and zenoh-pico,
   so a `Get` collected before its replies arrive is safe.
 - **Build options**: `include/zenoh_generic_config.h` (client or unicast
-  peer, TCP only, no serial / TLS / UDP / scouting; put, subscribe, query,
-  queryable, liveliness).
+  peer, TCP, and TLS on ESP-IDF; no serial / UDP / scouting; put,
+  subscribe, query, queryable, liveliness).
 - **Peer mode is polled too.** zenoh-pico accepts peers from its cooperative
   runtime (a non-blocking accept retried every second) and waits on the peer
   sockets with `select`. The gem compiles zenoh-pico's
