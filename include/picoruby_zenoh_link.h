@@ -40,4 +40,11 @@
  * peer closed it, the socket failed, or a send timed out. Never blocks. */
 bool zp_tcp_socket_closed(const _z_sys_net_socket_t *sock);
 
+/* The key namespace a session takes when Session.open is given none
+ * (namespace: nil), or NULL for none. The gem has a weak definition that
+ * returns NULL; a platform that knows one defines its own (the Family mruby
+ * browser build: room/<slot> of the room in the page's link). The string
+ * must stay valid while sessions are opened; it is copied at each open. */
+const char *picoruby_zenoh_default_namespace(void);
+
 #endif /* PICORUBY_ZENOH_LINK_H */

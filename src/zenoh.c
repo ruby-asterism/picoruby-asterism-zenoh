@@ -39,6 +39,23 @@
  * A peer session that only connects (no listener) is closed once it has no
  * peer left; a listening peer session stays open while peers come and go.
  *
+ * Namespace (zenoh-c's `namespace` setting, which zenoh-pico does not have):
+ * Session.open(..., namespace: "room/01") puts "room/01/" in front of every
+ * key the session sends (put, subscribe, liveliness_watch, queryable, get,
+ * liveliness, liveliness_get, and Query#reply with a key) and takes it off
+ * every key it receives (samples, liveliness entries, replies, Query#key).
+ * A received key that is not under the namespace (or is the namespace
+ * itself) is dropped and counted in that object's dropped; a query outside
+ * it is finished at once. On the wire this is the shape zenoh-c gives, so a
+ * zenoh-pico session and a zenoh-c one with the same namespace see each
+ * other's keys alike. It is not a boundary: the router's ACL is. Without
+ * namespace: the platform's default applies
+ * (picoruby_zenoh_default_namespace, include/picoruby_zenoh_link.h); "" is
+ * none. The session keeps the prefix (mrb_malloc); its subscribers,
+ * queryables and gets point at that buffer, which is safe because their
+ * callbacks run only inside the session's poll, and every Ruby object that
+ * can reach them holds the session (@session), so the buffer is freed last.
+ *
  * Lifetime: closing is optional. The Ruby objects close their zenoh-pico
  * counterparts when they are freed, in any order (an interpreter shutdown
  * frees objects in no particular order): a session keeps lists of its live
@@ -83,6 +100,8 @@
 #define ZRB_DEFAULT_POLL_STEPS 8
 #define ZRB_DEFAULT_GET_TIMEOUT_MS 2000
 #define ZRB_MAX_GET_TIMEOUT_MS 600000
+/* The longest key namespace (bytes). */
+#define ZRB_NS_MAX 63
 
 typedef struct zrb_sub zrb_sub;
 typedef struct zrb_qable zrb_qable;
@@ -96,6 +115,8 @@ typedef struct {
     zrb_sub *subs;  /* live subscribers and liveliness watches */
     zrb_qable *qables;
     zrb_token *tokens;
+    char *ns;      /* the key namespace (mrb_malloc), or NULL: see "Namespace" at the top */
+    size_t ns_len;
 } zrb_session;
 
 typedef struct {
@@ -123,6 +144,8 @@ struct zrb_sub {
     zrb_session *owner; /* NULL once detached (closed, or the session went away) */
     zrb_sub *next;
     zrb_ring ring; /* slots from mrb_malloc */
+    const char *ns; /* the session's namespace (its buffer), or NULL */
+    size_t ns_len;
 };
 
 struct zrb_qable {
@@ -130,6 +153,8 @@ struct zrb_qable {
     bool declared;
     zrb_session *owner;
     zrb_qable *next;
+    const char *ns; /* the session's namespace (its buffer), or NULL */
+    size_t ns_len;
     z_owned_query_t *slots; /* depth cloned queries (mrb_malloc) */
     uint32_t depth;
     uint32_t head;
@@ -153,6 +178,8 @@ typedef struct {
     uint32_t errors;
     bool done;     /* zenoh-pico dropped the closure: all replies in, or timed out */
     bool rb_alive; /* the Ruby object still refers to it */
+    const char *ns; /* the session's namespace (its buffer), or NULL */
+    size_t ns_len;
 } zrb_get;
 
 typedef struct {
@@ -200,6 +227,67 @@ static void zrb_view_key(mrb_state *mrb, z_view_keyexpr_t *ke, const char *key) 
     if (z_view_keyexpr_from_str(ke, key) != Z_OK) {
         mrb_raisef(mrb, E_ARGUMENT_ERROR, "invalid key expression: %s", key);
     }
+}
+
+/* ------------------------------------------------------------- namespace */
+
+/* Whether ns (len bytes) can be a namespace: 1..ZRB_NS_MAX bytes, a key
+ * expression without wildcards or special chunks (zenoh-c's namespace is an
+ * OwnedNonWildKeyExpr): no * $ ? #, no empty chunk (so no leading, trailing
+ * or doubled /), no chunk starting with @. */
+static bool zrb_ns_valid(const char *ns, size_t len) {
+    if (len < 1 || len > ZRB_NS_MAX) {
+        return false;
+    }
+    bool chunk_start = true;
+    for (size_t i = 0; i < len; i++) {
+        char c = ns[i];
+        if (c == '*' || c == '$' || c == '?' || c == '#' || c == '\0' || (unsigned char)c <= ' ') {
+            return false;
+        }
+        if (c == '/') {
+            if (chunk_start) {
+                return false; /* empty chunk */
+            }
+            chunk_start = true;
+            continue;
+        }
+        if (chunk_start && c == '@') {
+            return false;
+        }
+        chunk_start = false;
+    }
+    return !chunk_start; /* no trailing / */
+}
+
+/* The key on the wire for key: "<ns>/<key>" in a temporary String (kept by
+ * the GC arena until the method returns), or key itself without a namespace. */
+static const char *zrb_ns_key(mrb_state *mrb, const char *ns, size_t ns_len, const char *key) {
+    if (ns == NULL) {
+        return key;
+    }
+    size_t kl = strlen(key);
+    mrb_value str = mrb_str_new(mrb, NULL, (mrb_int)(ns_len + 1 + kl));
+    char *p = RSTRING_PTR(str);
+    memcpy(p, ns, ns_len);
+    p[ns_len] = '/';
+    memcpy(p + ns_len + 1, key, kl);
+    return mrb_string_value_cstr(mrb, &str);
+}
+
+/* Takes "<ns>/" off a received key in place (*kd, *kl). False when the key
+ * is not under the namespace (or is the namespace itself): such a value is
+ * dropped. Without a namespace every key passes as it is. */
+static bool zrb_ns_strip(const char *ns, size_t ns_len, const char **kd, size_t *kl) {
+    if (ns == NULL) {
+        return true;
+    }
+    if (*kl <= ns_len + 1 || memcmp(*kd, ns, ns_len) != 0 || (*kd)[ns_len] != '/') {
+        return false;
+    }
+    *kd += ns_len + 1;
+    *kl -= ns_len + 1;
+    return true;
 }
 
 static mrb_int zrb_check_depth(mrb_state *mrb, mrb_int depth) {
@@ -252,8 +340,8 @@ static bool zrb_read_bytes(const z_loaned_bytes_t *b, uint8_t *dst, size_t len) 
 
 /* Store key + payload (+ attachment). Called from inside zp_spin_once(): no
  * VM access. */
-static void zrb_ring_push(zrb_ring *r, const z_loaned_keyexpr_t *keyexpr, const z_loaned_bytes_t *payload,
-                          const z_loaned_bytes_t *attachment, bool alive) {
+static void zrb_ring_push(zrb_ring *r, const char *ns, size_t ns_len, const z_loaned_keyexpr_t *keyexpr,
+                          const z_loaned_bytes_t *payload, const z_loaned_bytes_t *attachment, bool alive) {
     z_view_string_t ks;
     if (z_keyexpr_as_view_string(keyexpr, &ks) != Z_OK) {
         r->dropped++;
@@ -261,6 +349,10 @@ static void zrb_ring_push(zrb_ring *r, const z_loaned_keyexpr_t *keyexpr, const 
     }
     const char *kd = z_string_data(z_loan(ks));
     size_t kl = z_string_len(z_loan(ks));
+    if (!zrb_ns_strip(ns, ns_len, &kd, &kl)) {
+        r->dropped++; /* outside the session's namespace */
+        return;
+    }
     size_t plen = (payload == NULL) ? 0 : z_bytes_len(payload);
     size_t alen = (attachment == NULL) ? 0 : z_bytes_len(attachment);
 
@@ -356,10 +448,11 @@ static void zrb_on_sample(z_loaned_sample_t *sample, void *ctx) {
     }
     if (s->liveliness) {
         /* A token appearing is a PUT, one going away a DELETE. */
-        zrb_ring_push(&s->ring, z_sample_keyexpr(sample), NULL, NULL, z_sample_kind(sample) == Z_SAMPLE_KIND_PUT);
+        zrb_ring_push(&s->ring, s->ns, s->ns_len, z_sample_keyexpr(sample), NULL, NULL,
+                      z_sample_kind(sample) == Z_SAMPLE_KIND_PUT);
     } else {
-        zrb_ring_push(&s->ring, z_sample_keyexpr(sample), z_sample_payload(sample), z_sample_attachment(sample),
-                      true);
+        zrb_ring_push(&s->ring, s->ns, s->ns_len, z_sample_keyexpr(sample), z_sample_payload(sample),
+                      z_sample_attachment(sample), true);
     }
 }
 
@@ -445,6 +538,22 @@ static void zrb_on_query(z_loaned_query_t *query, void *ctx) {
     zrb_qable *q = (zrb_qable *)ctx;
     if (q == NULL || q->slots == NULL) {
         return;
+    }
+    if (q->ns != NULL) {
+        /* A query outside the namespace (e.g. "**" from a session without
+         * one) is not handed on: not cloned, so it is finished when this
+         * callback returns. */
+        z_view_string_t ks;
+        if (z_keyexpr_as_view_string(z_query_keyexpr(query), &ks) != Z_OK) {
+            q->dropped++;
+            return;
+        }
+        const char *kd = z_string_data(z_loan(ks));
+        size_t kl = z_string_len(z_loan(ks));
+        if (!zrb_ns_strip(q->ns, q->ns_len, &kd, &kl)) {
+            q->dropped++;
+            return;
+        }
     }
     if (q->count == q->depth) {
         /* Full: finish the oldest unanswered. */
@@ -568,6 +677,9 @@ static mrb_value zrb_qable_each_pending(mrb_state *mrb, mrb_value self) {
     /* The queryable's own key goes with each query (Query#reply with one
      * argument looks at it); the same String, not a copy. */
     mrb_value qkey = mrb_iv_get(mrb, self, mrb_intern_lit(mrb, "@key"));
+    /* Each query keeps the session alive: Query#key and #reply use its
+     * namespace. */
+    mrb_value qses = mrb_iv_get(mrb, self, mrb_intern_lit(mrb, "@session"));
     mrb_value out = collect ? mrb_ary_new(mrb) : mrb_nil_value();
     mrb_int taken = 0;
     uint32_t todo = q->count;
@@ -577,6 +689,9 @@ static mrb_value zrb_qable_each_pending(mrb_state *mrb, mrb_value self) {
         mrb_value obj = zrb_query_wrap(mrb, &q->slots[q->head]);
         if (!mrb_nil_p(qkey)) {
             mrb_iv_set(mrb, obj, mrb_intern_lit(mrb, "@asterism_queryable_key"), qkey);
+        }
+        if (!mrb_nil_p(qses)) {
+            mrb_iv_set(mrb, obj, mrb_intern_lit(mrb, "@session"), qses);
         }
         q->head = (q->head + 1) % q->depth;
         q->count--;
@@ -639,13 +754,35 @@ static zrb_query *zrb_query_get_live(mrb_state *mrb, mrb_value self) {
     return zq;
 }
 
+/* The namespace of the session a query came in on (the Query object holds
+ * the session, @session), or NULL. */
+static const char *zrb_query_ns(mrb_state *mrb, mrb_value self, size_t *len) {
+    mrb_value ses = mrb_iv_get(mrb, self, mrb_intern_lit(mrb, "@session"));
+    *len = 0;
+    if (mrb_nil_p(ses)) {
+        return NULL;
+    }
+    zrb_session *z = (zrb_session *)mrb_data_check_get_ptr(mrb, ses, &zrb_session_type);
+    if (z == NULL || z->ns == NULL) {
+        return NULL;
+    }
+    *len = z->ns_len;
+    return z->ns;
+}
+
+/* q.key: the query's key expression, without the session's namespace. */
 static mrb_value zrb_query_key(mrb_state *mrb, mrb_value self) {
     zrb_query *zq = zrb_query_get_live(mrb, self);
     z_view_string_t ks;
     if (z_keyexpr_as_view_string(z_query_keyexpr(z_loan(zq->query)), &ks) != Z_OK) {
         return mrb_str_new_lit(mrb, "");
     }
-    return zrb_str_from_view(mrb, z_loan(ks));
+    const char *kd = z_string_data(z_loan(ks));
+    size_t kl = z_string_len(z_loan(ks));
+    size_t ns_len;
+    const char *ns = zrb_query_ns(mrb, self, &ns_len);
+    (void)zrb_ns_strip(ns, ns_len, &kd, &kl); /* the queryable let only keys under it through */
+    return mrb_str_new(mrb, kd, (mrb_int)kl);
 }
 
 static mrb_value zrb_query_params(mrb_state *mrb, mrb_value self) {
@@ -717,7 +854,9 @@ static mrb_value zrb_query_reply(mrb_state *mrb, mrb_value self) {
     if (mrb_nil_p(key_v)) {
         kp = z_query_keyexpr(z_loan(zq->query));
     } else {
-        zrb_view_key(mrb, &ke, mrb_string_value_cstr(mrb, &key_v));
+        size_t ns_len;
+        const char *ns = zrb_query_ns(mrb, self, &ns_len);
+        zrb_view_key(mrb, &ke, zrb_ns_key(mrb, ns, ns_len, mrb_string_value_cstr(mrb, &key_v)));
         kp = z_loan(ke);
     }
     z_owned_bytes_t att_bytes;
@@ -767,8 +906,8 @@ static void zrb_on_reply(z_loaned_reply_t *reply, void *ctx) {
     }
     if (z_reply_is_ok(reply)) {
         const z_loaned_sample_t *sample = z_reply_ok(reply);
-        zrb_ring_push(&g->ring, z_sample_keyexpr(sample), z_sample_payload(sample), z_sample_attachment(sample),
-                      true);
+        zrb_ring_push(&g->ring, g->ns, g->ns_len, z_sample_keyexpr(sample), z_sample_payload(sample),
+                      z_sample_attachment(sample), true);
     } else {
         g->errors++;
     }
@@ -937,6 +1076,9 @@ static void zrb_session_free(mrb_state *mrb, void *p) {
         return;
     }
     zrb_session_shutdown(z);
+    if (z->ns != NULL) {
+        mrb_free(mrb, z->ns);
+    }
     mrb_free(mrb, z);
 }
 
@@ -1107,9 +1249,10 @@ static void zrb_config_tls(mrb_state *mrb, z_owned_config_t *config, mrb_value t
  * Raises Asterism::Zenoh::Error when the session cannot be opened. */
 static mrb_value zrb_session_s_open(mrb_state *mrb, mrb_value klass) {
     mrb_value locator_v = mrb_nil_value();
-    mrb_sym kw_names[3] = {mrb_intern_lit(mrb, "mode"), mrb_intern_lit(mrb, "listen"), mrb_intern_lit(mrb, "tls")};
-    mrb_value kw_values[3];
-    mrb_kwargs kwargs = {3, 0, kw_names, kw_values, NULL};
+    mrb_sym kw_names[4] = {mrb_intern_lit(mrb, "mode"), mrb_intern_lit(mrb, "listen"), mrb_intern_lit(mrb, "tls"),
+                           mrb_intern_lit(mrb, "namespace")};
+    mrb_value kw_values[4];
+    mrb_kwargs kwargs = {4, 0, kw_names, kw_values, NULL};
     mrb_get_args(mrb, "|o:", &locator_v, &kwargs);
 
     bool peer = false;
@@ -1135,6 +1278,35 @@ static mrb_value zrb_session_s_open(mrb_state *mrb, mrb_value klass) {
         mrb_raise(mrb, zrb_error_class(mrb), "peer mode is not built in (Z_FEATURE_UNICAST_PEER)");
     }
 #endif
+    /* The namespace: namespace: (a String; "" for none), else the
+     * platform's default (picoruby_zenoh_default_namespace). */
+    const char *ns = NULL;
+    size_t ns_len = 0;
+    mrb_value ns_v = kw_values[3];
+    if (!mrb_undef_p(ns_v) && !mrb_nil_p(ns_v)) {
+        if (!mrb_string_p(ns_v)) {
+            mrb_raise(mrb, E_TYPE_ERROR, "namespace must be a String or nil");
+        }
+        ns_len = (size_t)RSTRING_LEN(ns_v);
+        if (ns_len > 0) {
+            ns = RSTRING_PTR(ns_v);
+            if (!zrb_ns_valid(ns, ns_len)) {
+                mrb_raisef(mrb, E_ARGUMENT_ERROR, "invalid namespace: %v (1..%d bytes, no wildcard, no empty or @ chunk)",
+                           ns_v, ZRB_NS_MAX);
+            }
+        }
+    } else {
+        ns = picoruby_zenoh_default_namespace();
+        if (ns != NULL && ns[0] == '\0') {
+            ns = NULL;
+        }
+        if (ns != NULL) {
+            ns_len = strlen(ns);
+            if (!zrb_ns_valid(ns, ns_len)) {
+                mrb_raisef(mrb, zrb_error_class(mrb), "the platform's default namespace is not valid: %s", ns);
+            }
+        }
+    }
 
     struct RClass *cls = mrb_class_ptr(klass);
     struct RData *data = mrb_data_object_alloc(mrb, cls, NULL, &zrb_session_type);
@@ -1142,6 +1314,12 @@ static mrb_value zrb_session_s_open(mrb_state *mrb, mrb_value klass) {
     memset(z, 0, sizeof(*z));
     data->data = z;
     mrb_value obj = mrb_obj_value(data);
+    if (ns != NULL) {
+        z->ns = (char *)mrb_malloc(mrb, ns_len + 1);
+        memcpy(z->ns, ns, ns_len);
+        z->ns[ns_len] = '\0';
+        z->ns_len = ns_len;
+    }
 
     z_owned_config_t config;
     if (z_config_default(&config) != Z_OK) {
@@ -1183,7 +1361,7 @@ static mrb_value zrb_session_put(mrb_state *mrb, mrb_value self) {
     zrb_session *z = zrb_session_get_open(mrb, self);
 
     z_view_keyexpr_t ke;
-    zrb_view_key(mrb, &ke, key);
+    zrb_view_key(mrb, &ke, zrb_ns_key(mrb, z->ns, z->ns_len, key));
     z_owned_bytes_t bytes;
     if (z_bytes_copy_from_buf(&bytes, (const uint8_t *)RSTRING_PTR(payload), (size_t)RSTRING_LEN(payload)) != Z_OK) {
         mrb_raise(mrb, zrb_error_class(mrb), "cannot allocate the payload");
@@ -1211,10 +1389,15 @@ static mrb_value zrb_session_put(mrb_state *mrb, mrb_value self) {
     return mrb_nil_value();
 }
 
+/* The platform's default namespace (include/picoruby_zenoh_link.h): none
+ * here. A platform defines its own (the Family mruby browser build: the
+ * room of the page's link). */
+__attribute__((weak)) const char *picoruby_zenoh_default_namespace(void) { return NULL; }
+
 static mrb_value zrb_sub_new(mrb_state *mrb, mrb_value self, zrb_session *z, const char *key, mrb_int depth,
                              bool liveliness) {
     z_view_keyexpr_t ke;
-    zrb_view_key(mrb, &ke, key);
+    zrb_view_key(mrb, &ke, zrb_ns_key(mrb, z->ns, z->ns_len, key));
 
     struct RClass *cls = zrb_class(mrb, liveliness ? "LivelinessWatch" : "Subscriber");
     struct RData *data = mrb_data_object_alloc(mrb, cls, NULL, &zrb_sub_type);
@@ -1226,6 +1409,8 @@ static mrb_value zrb_sub_new(mrb_state *mrb, mrb_value self, zrb_session *z, con
     memset(s->ring.slots, 0, sizeof(zrb_entry) * (size_t)depth);
     s->ring.depth = (uint32_t)depth;
     s->liveliness = liveliness;
+    s->ns = z->ns;
+    s->ns_len = z->ns_len;
 
     z_owned_closure_sample_t cb;
     z_closure(&cb, zrb_on_sample, NULL, s);
@@ -1286,7 +1471,7 @@ static mrb_value zrb_session_queryable(mrb_state *mrb, mrb_value self) {
     zrb_check_depth(mrb, depth);
     zrb_session *z = zrb_session_get_open(mrb, self);
     z_view_keyexpr_t ke;
-    zrb_view_key(mrb, &ke, key);
+    zrb_view_key(mrb, &ke, zrb_ns_key(mrb, z->ns, z->ns_len, key));
 
     struct RData *data = mrb_data_object_alloc(mrb, zrb_class(mrb, "Queryable"), NULL, &zrb_qable_type);
     zrb_qable *q = (zrb_qable *)mrb_malloc(mrb, sizeof(zrb_qable));
@@ -1298,6 +1483,8 @@ static mrb_value zrb_session_queryable(mrb_state *mrb, mrb_value self) {
         z_internal_query_null(&q->slots[i]);
     }
     q->depth = (uint32_t)depth;
+    q->ns = z->ns;
+    q->ns_len = z->ns_len;
 
     z_owned_closure_query_t cb;
     z_closure(&cb, zrb_on_query, NULL, q);
@@ -1394,10 +1581,12 @@ static mrb_value zrb_session_get_m(mrb_state *mrb, mrb_value self) {
     z_query_consolidation_t consolidation = zrb_get_consolidation(mrb, kw_values[2]);
     zrb_session *z = zrb_session_get_open(mrb, self);
     z_view_keyexpr_t ke;
-    zrb_view_key(mrb, &ke, key);
+    zrb_view_key(mrb, &ke, zrb_ns_key(mrb, z->ns, z->ns_len, key));
 
     zrb_get *g;
     mrb_value obj = zrb_get_new(mrb, depth, &g);
+    g->ns = z->ns;
+    g->ns_len = z->ns_len;
 
     z_get_options_t opts;
     z_get_options_default(&opts);
@@ -1441,7 +1630,7 @@ static mrb_value zrb_session_liveliness(mrb_state *mrb, mrb_value self) {
     mrb_get_args(mrb, "z", &key);
     zrb_session *z = zrb_session_get_open(mrb, self);
     z_view_keyexpr_t ke;
-    zrb_view_key(mrb, &ke, key);
+    zrb_view_key(mrb, &ke, zrb_ns_key(mrb, z->ns, z->ns_len, key));
 
     struct RData *data = mrb_data_object_alloc(mrb, zrb_class(mrb, "LivelinessToken"), NULL, &zrb_token_type);
     zrb_token *t = (zrb_token *)mrb_malloc(mrb, sizeof(zrb_token));
@@ -1473,10 +1662,12 @@ static mrb_value zrb_session_liveliness_get(mrb_state *mrb, mrb_value self) {
     mrb_int depth = zrb_kw_get_depth(mrb, kw_values[0]);
     zrb_session *z = zrb_session_get_open(mrb, self);
     z_view_keyexpr_t ke;
-    zrb_view_key(mrb, &ke, key);
+    zrb_view_key(mrb, &ke, zrb_ns_key(mrb, z->ns, z->ns_len, key));
 
     zrb_get *g;
     mrb_value obj = zrb_get_new(mrb, depth, &g);
+    g->ns = z->ns;
+    g->ns_len = z->ns_len;
     z_liveliness_get_options_t opts;
     z_liveliness_get_options_default(&opts);
     opts.timeout_ms = (uint64_t)timeout_ms;
@@ -1546,6 +1737,12 @@ static mrb_value zrb_session_zid(mrb_state *mrb, mrb_value self) {
     return out;
 }
 
+/* session.namespace -> String, or nil when the session has none. */
+static mrb_value zrb_session_namespace(mrb_state *mrb, mrb_value self) {
+    zrb_session *z = zrb_session_get(mrb, self);
+    return z->ns == NULL ? mrb_nil_value() : mrb_str_new(mrb, z->ns, (mrb_int)z->ns_len);
+}
+
 /* session.connection_count -> Integer: connected peers (peer mode), or
  * 1 / 0 for the router of a client session. (peers, its old name, is
  * defined in Ruby with a deprecation warning: mrblib/common.rb.) */
@@ -1590,7 +1787,7 @@ void mrb_picoruby_asterism_zenoh_gem_init(mrb_state *mrb) {
     struct RClass *ses = mrb_define_class_under(mrb, mod, "Session", mrb->object_class);
     MRB_SET_INSTANCE_TT(ses, MRB_TT_CDATA);
     mrb_undef_class_method(mrb, ses, "new");
-    mrb_define_class_method(mrb, ses, "open", zrb_session_s_open, MRB_ARGS_OPT(1) | MRB_ARGS_KEY(3, 0));
+    mrb_define_class_method(mrb, ses, "open", zrb_session_s_open, MRB_ARGS_OPT(1) | MRB_ARGS_KEY(4, 0));
     mrb_define_method(mrb, ses, "put", zrb_session_put, MRB_ARGS_REQ(2) | MRB_ARGS_KEY(1, 0));
     mrb_define_method(mrb, ses, "subscribe", zrb_session_subscribe, MRB_ARGS_ARG(1, 1));
     mrb_define_method(mrb, ses, "get", zrb_session_get_m, MRB_ARGS_ARG(1, 3) | MRB_ARGS_KEY(4, 0));
@@ -1601,6 +1798,7 @@ void mrb_picoruby_asterism_zenoh_gem_init(mrb_state *mrb) {
     mrb_define_method(mrb, ses, "poll", zrb_session_poll, MRB_ARGS_OPT(1));
     mrb_define_method(mrb, ses, "connection_count", zrb_session_connection_count, MRB_ARGS_NONE());
     mrb_define_method(mrb, ses, "zid", zrb_session_zid, MRB_ARGS_NONE());
+    mrb_define_method(mrb, ses, "namespace", zrb_session_namespace, MRB_ARGS_NONE());
     mrb_define_method(mrb, ses, "closed?", zrb_session_closed_p, MRB_ARGS_NONE());
     mrb_define_method(mrb, ses, "reconnecting?", zrb_session_reconnecting_p, MRB_ARGS_NONE());
     mrb_define_method(mrb, ses, "close", zrb_session_close, MRB_ARGS_NONE());

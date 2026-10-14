@@ -17,4 +17,6 @@ MRuby::Build.new("host") do |conf|
   conf.gem core: "mruby-io"
   conf.gem core: "mruby-enum-ext"
   conf.gem File.expand_path("..", __dir__)
+  # Test only: a platform default namespace (picoruby_zenoh_default_namespace).
+  conf.gem File.expand_path("ns_hook", __dir__)
 end

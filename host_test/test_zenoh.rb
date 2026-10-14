@@ -184,6 +184,141 @@ o1 = Object.new
 check(Asterism.warn_once(o1, "asterism: host test warning (expected)") == true, "warn_once warns")
 check(Asterism.warn_once(o1, "asterism: host test warning (not shown)") == false, "warn_once once per object")
 
+# ---- namespace ----------------------------------------------------------------
+# listener.rb's PORT+1 (namespace room/a) and PORT+2 (no namespace).
+pa = "tcp/127.0.0.1:#{port.to_i + 1}"
+pp = "tcp/127.0.0.1:#{port.to_i + 2}"
+check(s.namespace.nil?, "no namespace by default")
+["room/*", "/room", "room/", "room//a", "@x", "a/@b", "a$b", "a?b", "a#b", "a b", "x" * 64].each do |bad|
+  raises(ArgumentError, "namespace #{bad.inspect} refused") { Z::Session.open(pa, mode: :peer, namespace: bad) }
+end
+raises(TypeError, "namespace not a String") { Z::Session.open(pa, mode: :peer, namespace: 1) }
+raises(ArgumentError, "namespace: and config: differ") do
+  Z::Session.open(pa, mode: :peer, namespace: "room/a", config: { "namespace" => "room/b" })
+end
+
+def drain(s, obj, sec = 0.5)
+  out = []
+  t = Time.now
+  while Time.now - t < sec
+    s.poll
+    obj.each_pending { |*e| out << e }
+    usleep 5000
+  end
+  out
+end
+
+# Two sessions in room/a talk with plain keys.
+na = Z::Session.open(pa, mode: :peer, namespace: "room/a")
+check(na.namespace == "room/a", "Session#namespace #{na.namespace.inspect}")
+nsub = na.subscribe("pz/out/**")
+usleep 300_000
+na.poll
+na.put("pz/in/x", "hi")
+check(wait_for(na) { nsub.pending == 1 }, "room/a: echo arrives")
+check(nsub.each_pending == [["pz/out/x", "a:hi", nil]], "room/a: the key without the namespace")
+g = na.get("pz/q/one")
+check(wait_for(na) { g.done? }, "room/a: get done")
+check(g.each_reply == [["pz/q/one", "a:pz/q/one", nil]], "room/a: the queryable saw and answered the plain key")
+w = na.liveliness_watch("pz/alive/**")
+check(wait_for(na) { w.pending >= 1 }, "room/a: watch")
+check(w.each_pending == [["pz/alive/a", true]], "room/a: token without the namespace")
+na.close
+nc = Z::Session.open(pa, mode: :peer, config: { "namespace" => "room/a" })
+check(nc.namespace == "room/a", "config: \"namespace\" is taken")
+nc.close
+
+# A session without a namespace sees room/a/<key>.
+pl = Z::Session.open(pa, mode: :peer)
+check(pl.namespace.nil?, "plain session")
+psub = pl.subscribe("room/a/pz/out/**")
+pany = pl.subscribe("pz/out/**")
+usleep 300_000
+pl.poll
+pl.put("room/a/pz/in/y", "yv")
+pl.put("pz/in/z", "outside")
+check(wait_for(pl) { psub.pending == 1 }, "plain: echo through the prefixed key")
+check(psub.each_pending == [["room/a/pz/out/y", "a:yv", nil]], "plain: the key with the namespace")
+check(drain(pl, pany).empty?, "plain: a key outside the namespace reached nobody")
+g = pl.get("room/a/pz/q/two")
+check(wait_for(pl) { g.done? }, "plain: get done")
+check(g.each_reply == [["room/a/pz/q/two", "a:pz/q/two", nil]], "plain: reply with the namespace")
+w = pl.liveliness_watch("room/a/pz/alive/**")
+check(wait_for(pl) { w.pending >= 1 }, "plain: watch")
+check(w.each_pending == [["room/a/pz/alive/a", true]], "plain: the token with the namespace")
+pl.close
+
+# room/b sees nothing of room/a.
+nb = Z::Session.open(pa, mode: :peer, namespace: "room/b")
+bsub = nb.subscribe("pz/out/**")
+bw = nb.liveliness_watch("pz/alive/**")
+usleep 300_000
+nb.poll
+nb.put("pz/in/x", "b")
+g = nb.get("pz/q/one", timeout: 0.5)
+check(wait_for(nb) { g.done? }, "room/b: get ends")
+check(g.each_reply == [], "room/b: no reply from room/a")
+check(drain(nb, bsub).empty? && drain(nb, bw).empty?, "room/b: no echo, no token")
+nb.close
+
+# room/a against a peer that sees the wire: prefixed keys out, foreign ones dropped.
+np = Z::Session.open(pp, mode: :peer, namespace: "room/a")
+osub = np.subscribe("pz/out/**")
+all = np.subscribe("**", depth: 64)
+qa = np.queryable("pz/tq/**")
+tok = np.liveliness("pz/alive/t")
+w = np.liveliness_watch("pz/alive/**")
+usleep 300_000
+np.poll
+np.put("pz/in/w", "v")
+check(wait_for(np) { osub.pending == 1 }, "wire: echo")
+check(osub.each_pending == [["pz/out/w", "p:room/a/pz/in/w", nil]], "wire: the put carried room/a/")
+np.put("pz/in/exact", "")
+check(wait_for(np) { osub.pending == 1 }, "wire: exact done")
+check(osub.each_pending == [["pz/out/done", "", nil]], "wire: room/b/... not received")
+check(all.dropped == 1, "wire: the namespace itself is dropped and counted (#{all.dropped})")
+g = np.get("pz/q/three")
+check(wait_for(np) { g.done? }, "wire: get done")
+check(g.each_reply == [["pz/q/three", "p:room/a/pz/q/three", nil]], "wire: the get carried room/a/, the reply lost it")
+check(wait_for(np) { w.pending >= 1 }, "wire: watch")
+check(drain(np, w) == [["pz/alive/p", true]], "wire: only the room/a token, without the namespace")
+np.put("pz/in/ask", "")
+seen = []
+report = nil
+t = Time.now
+while report.nil? && Time.now - t < 4
+  np.poll
+  qa.each_pending do |q|
+    seen << q.key
+    q.reply(q.key, "t")
+  end
+  osub.each_pending { |k, v, _| report = v if k == "pz/out/report" }
+  usleep 5000
+end
+check(seen == ["pz/tq/k"], "wire: Query#key without the namespace #{seen.inspect}")
+check(qa.dropped == 1, "wire: the query ** (outside the namespace) dropped (#{qa.dropped})")
+check(report.to_s.start_with?("replies=room/a/pz/tq/k;"), "wire: Query#reply(key) carried room/a/ (#{report.inspect})")
+check(report.to_s.include?("room/a/pz/alive/t"), "wire: the token carried room/a/")
+tok.close
+np.close
+
+# The platform's default (host_test/ns_hook), and "" for none.
+PZTest.default_namespace = "room/a"
+d = Z::Session.open(pa, mode: :peer)
+check(d.namespace == "room/a", "the platform's default namespace")
+dsub = d.subscribe("pz/out/**")
+usleep 300_000
+d.poll
+d.put("pz/in/h", "d")
+check(wait_for(d) { dsub.pending == 1 } && dsub.each_pending == [["pz/out/h", "a:d", nil]], "default namespace works")
+d.close
+e = Z::Session.open(pa, mode: :peer, namespace: "")
+check(e.namespace.nil?, "namespace: \"\" is none, even with a default")
+e.close
+PZTest.default_namespace = "bad/*"
+raises(Z::Error, "an invalid platform default") { Z::Session.open(pa, mode: :peer) }
+PZTest.default_namespace = nil
+
 # ---- the listener goes away ------------------------------------------------------
 s.put("pz/in/stop", "")
 check(wait_for(s, 6) { w.pending >= 1 || s.closed? }, "token gone or session closed")

@@ -20,10 +20,10 @@ module Asterism
       class << self
         alias_method :__asterism_open, :open
 
-        # Session.open(locator = nil, mode: :client, listen: nil, config: nil) -> Session.
+        # Session.open(locator = nil, mode: :client, listen: nil, config: nil, namespace: nil) -> Session.
         # With a block: yields the session, closes it when the block ends
         # (also on an exception) and returns the block's value.
-        # config: a Hash of TLS settings only, under their zenoh names
+        # config: a Hash of TLS settings (and "namespace") only, under their zenoh names
         # ("transport/link/tls/root_ca_certificate_base64",
         # "connect_certificate_base64", "connect_private_key_base64",
         # "enable_mtls", "verify_name_on_connect"), for a tls/ locator; the
@@ -31,7 +31,11 @@ module Asterism
         # them. TLS links are built on ESP-IDF only (TLS). The CRuby
         # binding's other keywords (config_file:, scouting:, timestamping:,
         # connect_timeout:) and other config: keys raise ArgumentError here.
-        def open(locator = nil, mode: nil, listen: nil, config: nil, **opts)
+        # namespace: puts "<namespace>/" in front of every key the session
+        # sends and takes it off every key it receives (zenoh-c's
+        # "namespace" setting, which config: takes too); nil: the
+        # platform's default (none, or the browser build's room); "": none.
+        def open(locator = nil, mode: nil, listen: nil, config: nil, namespace: nil, **opts)
           unless opts.empty?
             names = opts.keys.map { |k| "#{k}:" }.join(", ")
             why = if opts.key?(:config_file)
@@ -43,9 +47,19 @@ module Asterism
                   end
             raise ArgumentError, "Session.open: #{names} not supported by the zenoh-pico binding (#{why})"
           end
+          if config.is_a?(Hash) && (config.key?("namespace") || config.key?(:namespace))
+            from_config = config.key?("namespace") ? config["namespace"] : config[:namespace]
+            if !namespace.nil? && namespace != from_config
+              raise ArgumentError, "Session.open: namespace: and config: \"namespace\" differ"
+            end
+            namespace = from_config
+            rest = {}
+            config.each { |k, v| rest[k] = v unless k.to_s == "namespace" }
+            config = rest
+          end
           tls = config.nil? ? nil : tls_settings(config)
           tls = nil if tls && tls.empty?
-          s = __asterism_open(locator, mode: mode, listen: listen, tls: tls)
+          s = __asterism_open(locator, mode: mode, listen: listen, tls: tls, namespace: namespace)
           return s unless block_given?
           begin
             yield s

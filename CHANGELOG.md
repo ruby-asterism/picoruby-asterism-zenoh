@@ -6,6 +6,13 @@ Ruby API for what both have.
 
 ## Unreleased
 
+- A key namespace on a session (`Session.open(..., namespace: "room/01")`,
+  or `config: {"namespace" => ...}`), the same wire shape as zenoh-c's
+  `namespace`: `<ns>/` in front of every key sent, taken off every key
+  received; keys and queries outside it are dropped and counted.
+  `Session#namespace`. A platform default through the weak hook
+  `picoruby_zenoh_default_namespace()` (include/picoruby_zenoh_link.h);
+  `namespace: ""` for none. Not a security boundary (the router's ACL is).
 - TLS links on ESP-IDF (`tls/<host>:<port>`, mutual TLS): the gem's own
   link (`src/zp_tls_link.c`) and stream over the platform's Mbed TLS
   (`ports/esp32/zp_tls_esp32.c`), with the TCP link's time limits and a

@@ -153,6 +153,38 @@ returns `false`, `closed?` is `true` and `put` raises
 received can still be taken from the subscribers. To go on, the application
 opens a new session (`Asterism::Zenoh::Session.open` again).
 
+## Namespace
+
+`Session.open(locator, namespace: "room/01")` (or `config: {"namespace" =>
+"room/01"}`, zenoh-c's name for it) gives the session a key namespace, as
+zenoh-c's `namespace` setting does (zenoh-pico has none): every key the
+session sends gets `room/01/` in front (put, subscribe, liveliness_watch,
+queryable, get, liveliness, liveliness_get, and `Query#reply` with a key),
+and every key it receives loses it (samples, liveliness entries, replies,
+`Query#key`). The application keeps writing `asterism/...`; on the wire and
+at the router it is `room/01/asterism/...`, the same shape a zenoh-c session
+with the same namespace gives, so the two see each other's keys alike.
+
+- A received key that is not under the namespace (only the namespace
+  itself can match, e.g. a subscriber of `**` sees a put on `room/01`) is
+  dropped and counted in that object's `dropped`. A query whose key is not
+  under it (`**` from a session without a namespace) is finished at once
+  and counted in the queryable's `dropped`.
+- A namespace is 1-63 bytes of a key expression without wildcards: no `*`
+  `$` `?` `#`, no empty chunk (no leading, trailing or doubled `/`), no chunk
+  starting with `@`. Anything else raises `ArgumentError`.
+- `namespace: nil` (not given) takes the platform's default:
+  `picoruby_zenoh_default_namespace()` (include/picoruby_zenoh_link.h),
+  which the gem defines weakly as none; a platform defines its own (the
+  Family mruby browser build: the room of the page's link). `namespace: ""`
+  is none, whatever the default. `Session#namespace` tells which.
+- **It is not a security boundary.** A session without a namespace (or one
+  that writes the prefix itself) reaches the keys inside it. What keeps a
+  namespace apart is the router's ACL on the prefixed keys
+  (`room/01/**`, and `room/01/**/@adv/**` for advanced pub/sub).
+- A session with a namespace does not see the router's admin space
+  (`@/**` becomes `room/01/@/**`).
+
 ## TLS
 
 On ESP-IDF the gem builds TLS links (`tls/<host>:<port>`, a client of a
