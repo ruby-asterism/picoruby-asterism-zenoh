@@ -126,11 +126,13 @@
 #ifndef Z_FEATURE_LINK_SERIAL_USB
 #define Z_FEATURE_LINK_SERIAL_USB 0
 #endif
-/* TLS links (tls/<host>:<port>, Mbed TLS) on ESP-IDF, where Mbed TLS is
- * part of the platform: ports/esp32/zp_tls_esp32.c is the stream and
- * src/zp_tls_link.c the link (zenoh-pico's own two block and are not
- * compiled there). Elsewhere off (zenoh-pico's own TLS needs an Mbed TLS
- * the host build does not have). */
+/* TLS links (tls/<host>:<port>, Mbed TLS): src/zp_tls_link.c is the link,
+ * the platform's stream is under it (zenoh-pico's own two block and are
+ * never compiled). On by default on ESP-IDF, where Mbed TLS is part of the
+ * platform (ports/esp32/zp_tls_esp32.c). Off by default on POSIX hosts: a
+ * host build that has an Mbed TLS 3.x with TLS 1.3 defines
+ * Z_FEATURE_LINK_TLS=1 for this gem and gives ports/posix/zp_tls_posix.c the
+ * Mbed TLS headers (README.md, TLS). */
 #ifndef Z_FEATURE_LINK_TLS
 #if defined(ZENOH_ESPIDF)
 #define Z_FEATURE_LINK_TLS 1

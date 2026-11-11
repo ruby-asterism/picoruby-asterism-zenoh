@@ -41,7 +41,7 @@ end
 | `Asterism::Zenoh::Session.open(locator)` | `Session` | Client mode, connects to the router at `locator` (`tcp/host:port`). Raises `Asterism::Zenoh::Error` when the router cannot be reached. Blocks while connecting (a few seconds at most). |
 | `Asterism::Zenoh::Session.open(locator, mode: :peer)` | `Session` | Peer mode without a router: connects to the peer at `locator`. |
 | `Asterism::Zenoh::Session.open(nil, mode: :peer, listen: "tcp/0.0.0.0:7447")` | `Session` | Peer mode, listening for peers (a `locator` may be given too). New peers are accepted by `poll` (checked about once a second). |
-| `Asterism::Zenoh::Session.open("tls/host:port", config: {...})` | `Session` | Client mode over TLS (ESP-IDF builds; `Asterism::Zenoh::TLS`). `config:` takes the TLS settings only, under their zenoh names: `transport/link/tls/root_ca_certificate_base64`, `connect_certificate_base64`, `connect_private_key_base64` (base64 of the PEM), `enable_mtls`, `verify_name_on_connect` -- the Hash `Asterism::Credentials#zenoh_config` makes from a console's `.tar`. See "TLS" below. |
+| `Asterism::Zenoh::Session.open("tls/host:port", config: {...})` | `Session` | Client mode over TLS (ESP-IDF builds, and POSIX builds that turn TLS on; `Asterism::Zenoh::TLS`). `config:` takes the TLS settings only, under their zenoh names: `transport/link/tls/root_ca_certificate_base64`, `connect_certificate_base64`, `connect_private_key_base64` (base64 of the PEM), `enable_mtls`, `verify_name_on_connect` -- the Hash `Asterism::Credentials#zenoh_config` makes from a console's `.tar`. See "TLS" below. |
 | `Asterism::Zenoh::Session.open(...) { \|s\| }` | the block's value | Closes the session after the block (also on an exception). The CRuby binding's other keywords (`config_file:`, `scouting:`, `timestamping:`, `connect_timeout:`) and other `config:` keys raise `ArgumentError` here. |
 | `session.zid` | String | This session's Zenoh ID in hex (what other nodes see as its ID; rmw_zenoh puts it in its liveliness keys). |
 | `session.connection_count` | Integer | Connected peers (peer mode), or 1 for the router of a client session; 0 once closed. (`peers` is its deprecated name.) |
@@ -199,7 +199,8 @@ header needs the Mbed TLS headers in the core. In their place:
 - `src/zp_tls_link.c`: the link, with the handshake read of the TCP link
   (one socket timeout before the first byte, then a time limit; a failed
   connection ends it).
-- `ports/esp32/zp_tls_esp32.c`: the stream. The socket I/O under Mbed TLS
+- `ports/esp32/zp_tls_esp32.c`: the stream on ESP-IDF (`ports/posix/zp_tls_posix.c`
+  on a POSIX host, below). The socket I/O under Mbed TLS
   never blocks; the TLS handshake (`PICORUBY_ZENOH_TLS_HANDSHAKE_TIMEOUT_MS`,
   10 s), the handshake read and a send wait on `select` up to their limits;
   the polled read never waits. Every Mbed TLS error other than "want
@@ -214,7 +215,26 @@ ESP-IDF project needs `CONFIG_MBEDTLS_SSL_PROTO_TLS1_3` and must call
 `psa_crypto_init()` once (the gem calls it before each handshake as well).
 Where Mbed TLS allocates is the project's choice
 (`CONFIG_MBEDTLS_*_MEM_ALLOC`); the gem's own context comes from its PSRAM
-allocator. On POSIX hosts TLS stays off (`Asterism::Zenoh::TLS` is false).
+allocator.
+
+On POSIX hosts TLS is off (`Asterism::Zenoh::TLS` is false) unless the host
+build turns it on. It then needs an Mbed TLS 3.x with TLS 1.3 (and PSA, which
+TLS 1.3 runs on) linked into the program, and gives this gem three things in
+its build configuration:
+
+```ruby
+conf.gem core: 'picoruby-asterism-zenoh' do |spec|
+  spec.cc.defines << 'Z_FEATURE_LINK_TLS=1'
+  spec.cc.defines << %q(MBEDTLS_CONFIG_FILE='"/path/to/mbedtls_config.h"') # if not the default
+  spec.cc.include_paths << '/path/to/mbedtls/include'
+end
+```
+
+The stream is then `ports/posix/zp_tls_posix.c` (the gem's posix port): the
+ESP-IDF stream's behaviour over BSD sockets, with CTR_DRBG as its random
+generator, EINTR as a retry, and the router's alert named in the log when it
+refuses the client's certificate. Without the define the file compiles to
+nothing and no Mbed TLS header is read.
 
 ## Design
 

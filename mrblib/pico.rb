@@ -28,7 +28,8 @@ module Asterism
         # "connect_certificate_base64", "connect_private_key_base64",
         # "enable_mtls", "verify_name_on_connect"), for a tls/ locator; the
         # certificates and the key are base64 of their PEM, as CRuby takes
-        # them. TLS links are built on ESP-IDF only (TLS). The CRuby
+        # them. TLS links are built on ESP-IDF, and on POSIX hosts that turn them
+        # on (TLS). The CRuby
         # binding's other keywords (config_file:, scouting:, timestamping:,
         # connect_timeout:) and other config: keys raise ArgumentError here.
         # namespace: puts "<namespace>/" in front of every key the session

@@ -11,7 +11,11 @@
 # Platforms (zenoh-pico's platform selector, ZENOH_PICO_PLATFORM overrides):
 # - POSIX (ZENOH_LINUX, or ZENOH_MACOS / ZENOH_BSD): everything is compiled
 #   here, with this gem's src/zp_tcp_posix.c as the TCP link and
-#   src/zp_network_posix.c as the socket helpers.
+#   src/zp_network_posix.c as the socket helpers. TLS links are off unless
+#   the host build turns them on (Z_FEATURE_LINK_TLS=1 for this gem, with
+#   the include paths and config of an Mbed TLS 3.x that has TLS 1.3); the
+#   stream is then ports/posix/zp_tls_posix.c, compiled here as the gem's
+#   posix port (README.md, TLS).
 # - ESP-IDF (ZENOH_ESPIDF, chosen for build names starting with "esp32"): the
 #   zenoh-pico core and the gem are compiled here with the platform types of
 #   include/zenoh_espidf_platform.h, which need no ESP-IDF headers. The
@@ -98,16 +102,14 @@ MRuby::Gem::Specification.new('picoruby-asterism-zenoh') do |spec|
     link/endpoint.c
     link/transport/tcp/address.c
     link/transport/upper/serial_protocol.c
-    link/transport/upper/tls_stream.c
   ].map { |f| "#{zp_dir}/src/#{f}" }
-  # ESP-IDF builds TLS links (include/zenoh_generic_config.h) with this gem's
-  # own: the link src/zp_tls_link.c (compiled here, like every src/*.c) and
-  # the stream ports/esp32/zp_tls_esp32.c (Mbed TLS, compiled by the ESP-IDF
-  # component). zenoh-pico's two would block in a polled session, and its
-  # stream needs the Mbed TLS headers this compiler does not have.
-  unless posix
-    srcs -= %w[link/unicast/tls.c link/transport/upper/tls_stream.c].map { |f| "#{zp_dir}/src/#{f}" }
-  end
+  # TLS links (include/zenoh_generic_config.h) are this gem's own on every
+  # platform: the link src/zp_tls_link.c (compiled here, like every src/*.c)
+  # and the platform's stream, ports/esp32/zp_tls_esp32.c (compiled by the
+  # ESP-IDF component) or ports/posix/zp_tls_posix.c (the posix port).
+  # zenoh-pico's two would block in a polled session, and its stream needs
+  # the Mbed TLS headers in the core, so they are never compiled.
+  srcs -= %w[link/unicast/tls.c link/transport/upper/tls_stream.c].map { |f| "#{zp_dir}/src/#{f}" }
   # system/unix/network.c (socket helpers) is replaced by this gem's
   # src/zp_network_posix.c (EINTR-safe wait on the peer sockets).
   if posix

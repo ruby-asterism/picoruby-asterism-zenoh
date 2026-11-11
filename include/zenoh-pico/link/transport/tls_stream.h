@@ -23,24 +23,21 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  *
- * The TLS stream, as the zenoh-pico core sees it, on ESP-IDF.
+ * The TLS stream, as the zenoh-pico core sees it, on every platform.
  *
  * zenoh-pico's link.h includes this header, and zenoh-pico's own version
- * includes the Mbed TLS headers to lay out the TLS context. In an ESP-IDF
- * build the core is compiled by the mruby build with the bare cross
- * compiler, which has no ESP-IDF (and so no Mbed TLS) include paths. The
- * core never looks inside the context (it only calls the functions below),
- * so here the context is an incomplete type; ports/esp32/zp_tls_esp32.c,
- * compiled by the ESP-IDF component, defines it. This directory comes
- * before zenoh-pico's include/ on the include path, so this file is the one
- * found; nothing in the zenoh-pico checkout is edited.
- *
- * Other platforms get zenoh-pico's own header (#include_next).
+ * includes the Mbed TLS headers to lay out the TLS context. The core is
+ * compiled by the mruby build, which has no Mbed TLS include paths (on
+ * ESP-IDF the bare cross compiler has no ESP-IDF headers at all). The core
+ * never looks inside the context (it only calls the functions below), so
+ * here the context is an incomplete type, defined by the platform's stream:
+ * ports/esp32/zp_tls_esp32.c (compiled by the ESP-IDF component) or
+ * ports/posix/zp_tls_posix.c (compiled with the Mbed TLS headers the host
+ * build gives it). This directory comes before zenoh-pico's include/ on the
+ * include path, so this file is the one found; nothing in the zenoh-pico
+ * checkout is edited, and zenoh-pico's own TLS link and stream are never
+ * compiled. Without TLS links (Z_FEATURE_LINK_TLS 0) it declares nothing.
  */
-#if !defined(ZENOH_ESPIDF)
-#include_next "zenoh-pico/link/transport/tls_stream.h"
-#else
-
 #ifndef ZENOH_PICO_LINK_TRANSPORT_TLS_STREAM_H
 #define ZENOH_PICO_LINK_TRANSPORT_TLS_STREAM_H
 
@@ -56,7 +53,7 @@ extern "C" {
 
 #if Z_FEATURE_LINK_TLS == 1
 
-/* Defined by ports/esp32/zp_tls_esp32.c (Mbed TLS state). */
+/* Defined by the platform's stream (ports/esp32, ports/posix; Mbed TLS state). */
 typedef struct zp_tls_context _z_tls_context_t;
 
 typedef struct {
@@ -92,4 +89,3 @@ size_t _z_write_all_tls(const _z_tls_socket_t *sock, const uint8_t *ptr, size_t 
 #endif
 
 #endif /* ZENOH_PICO_LINK_TRANSPORT_TLS_STREAM_H */
-#endif /* ZENOH_ESPIDF */

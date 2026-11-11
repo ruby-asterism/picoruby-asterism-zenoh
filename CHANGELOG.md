@@ -6,6 +6,13 @@ Ruby API for what both have.
 
 ## Unreleased
 
+- TLS links on POSIX hosts, when the host build turns them on
+  (`Z_FEATURE_LINK_TLS=1` for this gem and the include paths of an Mbed TLS
+  3.x with TLS 1.3): the stream `ports/posix/zp_tls_posix.c`, the ESP-IDF
+  stream's behaviour over BSD sockets, with the router's alert named in the
+  log. The gem's TLS link and its `tls_stream.h` are now used on every
+  platform; zenoh-pico's own TLS link and stream are never compiled. Off by
+  default: a POSIX build without the define is unchanged.
 - A key namespace on a session (`Session.open(..., namespace: "room/01")`,
   or `config: {"namespace" => ...}`), the same wire shape as zenoh-c's
   `namespace`: `<ns>/` in front of every key sent, taken off every key

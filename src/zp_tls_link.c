@@ -23,10 +23,11 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  *
- * The TLS link (tls/<host>:<port>) on ESP-IDF, used by picoruby-asterism-zenoh
- * in place of zenoh-pico's src/link/unicast/tls.c (that file is not compiled
- * there; the zenoh-pico checkout itself is not edited). The stream under it
- * is ports/esp32/zp_tls_esp32.c. Changes:
+ * The TLS link (tls/<host>:<port>), used by picoruby-asterism-zenoh in place
+ * of zenoh-pico's src/link/unicast/tls.c (that file is never compiled; the
+ * zenoh-pico checkout itself is not edited). The stream under it is the
+ * platform's: ports/esp32/zp_tls_esp32.c on ESP-IDF, ports/posix/zp_tls_posix.c
+ * on a POSIX host that turns TLS links on. Changes:
  *
  * 1. The handshake read (_read_exact_f) is the stream's zp_tls_read_exact,
  *    which has the TCP link's time limits and ends on a failed connection.
@@ -53,7 +54,7 @@
 #include "zenoh-pico/utils/logging.h"
 #include "zenoh-pico/utils/string.h"
 
-#if Z_FEATURE_LINK_TLS == 1 && defined(ZENOH_ESPIDF)
+#if Z_FEATURE_LINK_TLS == 1
 
 uint16_t _z_get_link_mtu_tls(void) { return 65535; }
 
@@ -269,4 +270,4 @@ cleanup:
     return ret;
 }
 
-#endif  // Z_FEATURE_LINK_TLS == 1 && defined(ZENOH_ESPIDF)
+#endif  // Z_FEATURE_LINK_TLS == 1
