@@ -83,6 +83,7 @@
 
 #include <zenoh-pico.h>
 #include <zenoh-pico/link/link.h>
+#include <zenoh-pico/net/encoding.h>
 #include <zenoh-pico/net/session.h>
 
 #include "picoruby_zenoh_link.h"
@@ -360,13 +361,125 @@ static bool zrb_read_bytes(const z_loaned_bytes_t *b, uint8_t *dst, size_t len) 
     return z_bytes_reader_read(&reader, dst, len) == len;
 }
 
+/* ------------------------------------------------------------- encodings */
+
+/* Encodings by name <-> zenoh's numbered ones, done here instead of with
+ * zenoh-pico's z_encoding_from_str / z_encoding_to_string: those use
+ * ENCODING_VALUES_ID_TO_STR (src/api/encoding.c), an array of writable
+ * pointers that lands in .data (212 bytes of internal RAM on the ESP32
+ * boards). This table is const all the way down, so it stays in flash.
+ * The names and their order are zenoh-pico 1.10.1's (ZENOH_PICO_PIN; the
+ * numbers are Zenoh's), and the conversions below give the same results as
+ * zenoh-pico's own, quirks included. They build and read
+ * _z_encoding_t directly (_z_encoding_make, ->id, ->schema): internals of
+ * the pinned release, like the session and link ones used elsewhere. */
+static const char *const zrb_encoding_names[] = {
+    "zenoh/bytes",
+    "zenoh/string",
+    "zenoh/serialized",
+    "application/octet-stream",
+    "text/plain",
+    "application/json",
+    "text/json",
+    "application/cdr",
+    "application/cbor",
+    "application/yaml",
+    "text/yaml",
+    "text/json5",
+    "application/python-serialized-object",
+    "application/protobuf",
+    "application/java-serialized-object",
+    "application/openmetrics-text",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/bmp",
+    "image/webp",
+    "application/xml",
+    "application/x-www-form-urlencoded",
+    "text/html",
+    "text/xml",
+    "text/css",
+    "text/javascript",
+    "text/markdown",
+    "text/csv",
+    "application/sql",
+    "application/coap-payload",
+    "application/json-patch+json",
+    "application/json-seq",
+    "application/jsonpath",
+    "application/jwt",
+    "application/mp4",
+    "application/soap+xml",
+    "application/yang",
+    "audio/aac",
+    "audio/flac",
+    "audio/mp4",
+    "audio/ogg",
+    "audio/vorbis",
+    "video/h261",
+    "video/h263",
+    "video/h264",
+    "video/h265",
+    "video/h266",
+    "video/mp4",
+    "video/ogg",
+    "video/raw",
+    "video/vp8",
+    "video/vp9",
+};
+#define ZRB_ENCODING_COUNT (sizeof(zrb_encoding_names) / sizeof(zrb_encoding_names[0]))
+#define ZRB_ENCODING_SEPARATOR ';'
+
+/* An encoding from its name: "<name>" or "<name>;<schema>" for a numbered
+ * one; anything else is kept whole as the schema of the default encoding.
+ * As zenoh-pico, the name before ';' matches a numbered one when it equals
+ * that many first characters of it. */
+static z_result_t zrb_encoding_from_str(z_owned_encoding_t *out, const char *s) {
+    size_t len = strlen(s);
+    size_t pos = 0;
+    while (pos < len && s[pos] != ZRB_ENCODING_SEPARATOR) {
+        pos++;
+    }
+    out->_val = _z_encoding_null();
+    if (pos != 0) {
+        for (size_t i = 0; i < ZRB_ENCODING_COUNT; i++) {
+            if (strncmp(s, zrb_encoding_names[i], pos) == 0) {
+                const char *schema = NULL;
+                size_t rest = 0;
+                if (pos + 1 < len) {
+                    schema = s + pos + 1;
+                    rest = len - pos - 1;
+                }
+                return _z_encoding_make(&out->_val, (uint16_t)i, schema, rest);
+            }
+        }
+    }
+    return _z_encoding_make(&out->_val, 0, s, len);
+}
+
 /* Whether enc is the default encoding (zenoh/bytes, nothing on the wire). */
 static bool zrb_encoding_is_default(const z_loaned_encoding_t *enc) {
-#if Z_FEATURE_ENCODING_VALUES == 1
-    return z_encoding_equals(enc, z_encoding_loan_default());
-#else
     return enc->id == 0 && _z_string_len(&enc->schema) == 0;
-#endif
+}
+
+/* The length of enc's name ("<name>" or "<name>;<schema>"; an unknown
+ * number has no name, as zenoh-pico prints it). */
+static size_t zrb_encoding_name_len(const z_loaned_encoding_t *enc, const char **prefix) {
+    *prefix = (enc->id < ZRB_ENCODING_COUNT) ? zrb_encoding_names[enc->id] : "";
+    size_t sl = _z_string_len(&enc->schema);
+    return strlen(*prefix) + (sl > 0 ? 1 + sl : 0);
+}
+
+/* Writes enc's name to dst (zrb_encoding_name_len bytes, no NUL). */
+static void zrb_encoding_name_write(const z_loaned_encoding_t *enc, const char *prefix, uint8_t *dst) {
+    size_t pl = strlen(prefix);
+    size_t sl = _z_string_len(&enc->schema);
+    memcpy(dst, prefix, pl);
+    if (sl > 0) {
+        dst[pl] = ZRB_ENCODING_SEPARATOR;
+        memcpy(dst + pl + 1, _z_string_data(&enc->schema), sl);
+    }
 }
 
 /* What a sample carries besides its key, payload and attachment. */
@@ -395,17 +508,11 @@ static void zrb_ring_push(zrb_ring *r, const char *ns, size_t ns_len, const z_lo
     }
     size_t plen = (payload == NULL) ? 0 : z_bytes_len(payload);
     size_t alen = (attachment == NULL) ? 0 : z_bytes_len(attachment);
-    z_owned_string_t enc_str;
-    z_internal_string_null(&enc_str);
+    const char *enc_prefix = NULL;
     size_t elen = 0;
     if (meta->encoding != NULL && !zrb_encoding_is_default(meta->encoding)) {
-        if (z_encoding_to_string(meta->encoding, &enc_str) != Z_OK) {
-            r->dropped++;
-            return;
-        }
-        elen = z_string_len(z_loan(enc_str));
+        elen = zrb_encoding_name_len(meta->encoding, &enc_prefix);
         if (elen > UINT16_MAX) {
-            z_drop(z_move(enc_str));
             r->dropped++;
             return;
         }
@@ -414,22 +521,19 @@ static void zrb_ring_push(zrb_ring *r, const char *ns, size_t ns_len, const z_lo
 
     uint8_t *buf = (uint8_t *)z_malloc(kl + plen + alen + elen + tlen + 1);
     if (buf == NULL) {
-        z_drop(z_move(enc_str));
         r->dropped++;
         return;
     }
     memcpy(buf, kd, kl);
     if ((plen > 0 && !zrb_read_bytes(payload, buf + kl, plen)) ||
         (alen > 0 && !zrb_read_bytes(attachment, buf + kl + plen, alen))) {
-        z_drop(z_move(enc_str));
         z_free(buf);
         r->dropped++;
         return;
     }
     if (elen > 0) {
-        memcpy(buf + kl + plen + alen, z_string_data(z_loan(enc_str)), elen);
+        zrb_encoding_name_write(meta->encoding, enc_prefix, buf + kl + plen + alen);
     }
-    z_drop(z_move(enc_str));
     if (tlen > 0) {
         uint64_t t = z_timestamp_ntp64_time(meta->timestamp);
         z_id_t id = z_timestamp_id(meta->timestamp);
@@ -1008,7 +1112,7 @@ static void zrb_put_parts_make(mrb_state *mrb, zrb_put_parts *pp, mrb_value payl
         pp->has_att = true;
     }
     if (enc_s != NULL) {
-        if (z_encoding_from_str(&pp->enc, enc_s) != Z_OK) {
+        if (zrb_encoding_from_str(&pp->enc, enc_s) != Z_OK) {
             z_drop(z_move(pp->payload));
             if (pp->has_att) {
                 z_drop(z_move(pp->att));
@@ -1674,7 +1778,7 @@ static mrb_value zrb_session_publisher(mrb_state *mrb, mrb_value self) {
     z_publisher_options_default(&opts);
     z_owned_encoding_t enc_o;
     if (enc_s != NULL) {
-        if (z_encoding_from_str(&enc_o, enc_s) != Z_OK) {
+        if (zrb_encoding_from_str(&enc_o, enc_s) != Z_OK) {
             mrb_raise(mrb, zrb_error_class(mrb), "cannot allocate the encoding");
         }
         opts.encoding = z_move(enc_o);
