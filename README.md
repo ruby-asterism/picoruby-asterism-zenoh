@@ -45,16 +45,21 @@ end
 | `Asterism::Zenoh::Session.open(...) { \|s\| }` | the block's value | Closes the session after the block (also on an exception). The CRuby binding's other keywords (`config_file:`, `scouting:`, `timestamping:`, `connect_timeout:`) and other `config:` keys raise `ArgumentError` here. |
 | `session.zid` | String | This session's Zenoh ID in hex (what other nodes see as its ID; rmw_zenoh puts it in its liveliness keys). |
 | `session.connection_count` | Integer | Connected peers (peer mode), or 1 for the router of a client session; 0 once closed. (`peers` is its deprecated name.) |
-| `session.put(key, payload, attachment: nil)` | `nil` | `payload` is a String (bytes, sent as is); `attachment:` a String sent as the sample's attachment (Zenoh's per-sample metadata, which ROS 2's rmw_zenoh requires), or nil for none. `ArgumentError` on a bad key, `Asterism::Zenoh::ClosedError` when the session is closed or the connection is found lost (see below), `Asterism::Zenoh::Error` when the put fails. Waits at most `SEND_TIMEOUT_MS` for room to send. |
+| `session.put(key, payload, attachment: nil, encoding: nil)` | `nil` | `payload` is a String (bytes, sent as is); `attachment:` a String sent as the sample's attachment (Zenoh's per-sample metadata, which ROS 2's rmw_zenoh requires), or nil for none. `encoding:` the name zenoh prints (`"image/jpeg"`, `"text/plain;charset=utf-8"`): one of Zenoh's numbered encodings goes as its number (a byte or two), any other name as a string; nil (the default) sends none. `ArgumentError` on a bad key, `Asterism::Zenoh::ClosedError` when the session is closed or the connection is found lost (see below), `Asterism::Zenoh::Error` when the put fails. Waits at most `SEND_TIMEOUT_MS` for room to send. |
+| `session.publisher(key, encoding: nil)` | `Publisher` | A declared publisher: zenoh declares `key` once and sends it as a number afterwards, and a put no subscriber matches is not sent. `encoding:` the publisher's own (as for `put`). Undeclared by `close`, garbage collection, or the session closing. |
+| `pub.put(payload, attachment: nil, encoding: nil)` | `nil` | As `session.put`; `encoding:` nil sends the publisher's own. `Asterism::Zenoh::Error` once closed. |
+| `pub.close` / `pub.closed?` | | |
 | `session.subscribe(key, depth: 16)` | `Subscriber` | `key` may be a key expression (`demo/**`). Up to `depth` received values are kept until read. |
 | `session.poll(steps = 8)` | `true` / `false` | Reads the socket and runs keep-alive / lease work, at most `steps` times. Does not wait for data. `false` once the session has closed (closed by the app, or the connection was lost: see below). |
 | `session.closed?` | `true` / `false` | Also notices a lost connection. |
-| `session.close` | `nil` | Closes the subscribers too. Idempotent. Optional (see below). |
+| `session.close` | `nil` | Closes the subscribers, publishers, queryables and tokens too. Idempotent. Optional (see below). |
 | `sub.each_pending { \|key, payload, attachment\| }` | Integer | Takes out the values received so far (oldest first). `attachment` is a String, or nil when the sample had none (or an empty one). Without a block, returns them as `[[key, payload, attachment], ...]`. |
+| `sub.each_sample { \|sample\| }` | Integer | The same queue as `each_pending`, as `Asterism::Zenoh::Sample` (`key`, `payload`, `attachment`, `kind` `:put` / `:delete`, `encoding`, `timestamp`; `put?`, `delete?`, `text`, `to_h`). `encoding` is the name zenoh prints, `"zenoh/bytes"` when the sender gave none (as on CRuby). `timestamp` is an `Asterism::Zenoh::Timestamp` when the sender or a router stamped the sample (a router does by default; two peers do not), else nil. Without a block, an Array. CRuby's other members (`priority`, ...) are not here. |
 | `sub.pending` / `sub.received` / `sub.dropped` | Integer | Waiting values / total received / dropped because the ring was full (the oldest goes). |
 | `sub.close` / `sub.closed?` | | Pending values can still be taken after close. |
 | `session.get(key, timeout: 2.0, params: nil, payload: nil, attachment: nil, target: :all, consolidation: :none, depth: 16)` | `Get` | Sends a query and returns at once. `depth:` (1..1024) is how many replies are kept until taken (see Queue depths). `timeout:` is seconds; `timeout_ms:` (1..600000) is the same in milliseconds. `attachment:` is a String sent with the query, or nil. `target:` `:all` (every matching queryable, the default), `:all_complete` (only queryables declared `complete: true`; what ROS 2's rmw_zenoh clients send) or `:best_matching`. `consolidation:` `:none` (every reply is kept, the default; zenoh's own default is `:auto`), `:latest`, `:monotonic` or `:auto`. |
 | `get.each_reply { \|key, payload, attachment\| }` | Integer | Replies received so far (oldest first); `attachment` is a String, or nil when the reply had none. Without a block, an Array of `[key, payload, attachment]`. Error replies are not yielded, only counted. |
+| `get.each_result { \|reply\| }` | Integer | The same queue as `each_reply`, as `Asterism::Zenoh::Reply` (the members of a `Sample`, `ok?` always true: error replies are only counted here, unlike CRuby's `each_result`). |
 | `get.done?` | `true` / `false` | True once every replier has finished, the time limit has passed, or the session closed. The limit is checked once a second by `poll`, so `done?` turns true up to about 1 s after it. |
 | `get.pending` / `received` / `dropped` / `errors` | Integer | Up to `depth` replies (16 by default) are kept; more drop the oldest, counted in `dropped`. |
 | `session.queryable(key, depth: 16, complete: false)` | `Queryable` | Answers queries matching `key`. Up to `depth` unanswered queries are kept; more finish the oldest unanswered (the requester gets nothing from it) and count it as dropped. `complete: true` declares that it answers for every key matching `key`; only such queryables receive queries sent with `target: :all_complete`. |
@@ -67,6 +72,7 @@ end
 | `session.liveliness(key)` | `LivelinessToken` | Announces `key` as alive until `token.close`, garbage collection, or the session closing. |
 | `session.liveliness_watch(key, depth: 16)` | `LivelinessWatch` | `each_pending { \|key, alive\| }` (alive is `true` when a token appeared, `false` when it went away); the tokens alive when the watch starts come first. Tokens of the same session are not reported (zenoh-pico does not report its own). Also `pending` / `received` / `dropped` / `close` / `closed?`. |
 | `session.liveliness_get(key, timeout: 2.0, depth: 16)` | `Get` | The tokens alive now, as replies (empty payload). Or `timeout_ms:`. `depth:` as for `get`. |
+| `Asterism::Zenoh::Timestamp` | | `ntp64` (Integer: seconds since 1970 in the upper 32 bits, the fraction in the lower 32), `id` (the clock's Zenoh ID, hex), `to_time`, Comparable. |
 | `Asterism::Zenoh::PICO_VERSION` / `BACKEND_VERSION` | String | zenoh-pico version compiled in. |
 | `Asterism::Zenoh::BACKEND` / `VERSION` | `:zenoh_pico` / String | `:zenoh_c` on CRuby; the gem's version (the same as asterism-zenoh's). |
 | `Asterism::Error` > `Asterism::Zenoh::Error` > `Asterism::Zenoh::ClosedError` | | `ClosedError`: the session is closed or its connection was lost. `Error#code`: zenoh-pico's result code when there was one. |
@@ -243,7 +249,9 @@ nothing and no Mbed TLS header is read.
   `poll` regularly (every few hundred ms at least: the router drops a client
   it has not heard from for the lease time, 10 s).
 - **The receive callback does not touch the VM.** It copies key and payload
-  into a bounded ring; `each_pending` makes the Ruby strings.
+  (and attachment, encoding and timestamp, when there are) into a bounded
+  ring; `each_pending` / `each_sample` make the Ruby values. The default
+  encoding takes no room.
 - **Memory**: the gem's own structures use the mruby allocator (`mrb_malloc`),
   zenoh-pico and the received values use zenoh-pico's allocator (`z_malloc`).
   The gem does not depend on any host-specific allocator so that it builds
@@ -317,14 +325,20 @@ Platforms (`ZENOH_PICO_PLATFORM` overrides the choice):
 platform) and runs `host_test/test_zenoh.rb` against `host_test/listener.rb`:
 two mruby processes over a local TCP peer link (no router needed), covering
 put / subscribe with attachments, the bounded ring, get / queryable,
-liveliness watches, the argument checks, and a connecting session closing
-when its peer goes away. It needs git, a C compiler and CRuby with rake.
+liveliness watches, encodings and declared publishers (`each_sample`,
+`each_result`), the argument checks, and a connecting session closing when
+its peer goes away. It needs git, a C compiler and CRuby with rake.
+
+`rake test_cruby` checks the same against zenoh-c, through a zenoh-c router
+(the router's timestamps reach `Sample#timestamp`): CRuby with a built
+asterism-zenoh checkout (`../asterism-zenoh`, or `ASTERISM_ZENOH_DIR`).
 
 ```
 rake                  # zenoh:fetch, mruby:fetch, build, test
 rake zenoh:fetch      # clone the zenoh-pico pinned in ZENOH_PICO_PIN into vendor/zenoh-pico
 rake mruby:fetch      # clone the mruby pinned in host_test/MRUBY_PIN into vendor/mruby
 rake build            # build it (tmp/mruby_build/host/bin/mruby)
+rake test_cruby       # against zenoh-c (asterism-zenoh)
 ZENOH_PICO_DIR=... MRUBY_DIR=... rake test   # use other checkouts
 ```
 

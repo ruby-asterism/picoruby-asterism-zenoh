@@ -143,6 +143,87 @@ check(wait_for(s, 4) { g2.done? }, "get with nobody to answer ends")
 check(g2.each_reply == [], "no replies")
 raises(ArgumentError, "bad target") { s.get("pz/q/x", timeout_ms: 100, target: :bogus) }
 
+# ---- encoding, publisher, Sample / Reply / Timestamp ----------------------------
+# listener.rb echoes each put with its attachment and encoding; "viapub"
+# comes back through the listener's declared publisher (encoding text/plain).
+sub.each_pending
+s.put("pz/in/ej", "\xff\xd8jpeg", attachment: "\x01", encoding: "image/jpeg")
+s.put("pz/in/en", "plain")
+s.put("pz/in/es", "{}", encoding: "application/json;schema=x")
+check(wait_for(s) { sub.pending == 3 }, "encoded echoes (pending #{sub.pending})")
+got = sub.each_sample
+check(got.size == 3 && got.all? { |x| x.is_a?(Z::Sample) }, "each_sample gives Samples #{got.inspect}")
+a, b, c = got
+check(a.key == "pz/out/ej" && a.payload == "\xff\xd8jpeg" && a.attachment == "\x01" && a.encoding == "image/jpeg",
+      "image/jpeg came back #{a.to_h.inspect}")
+check(b.encoding == "zenoh/bytes" && b.attachment.nil?, "no encoding given: zenoh/bytes, as CRuby says (#{b.encoding.inspect})")
+check(c.encoding == "application/json;schema=x", "a schema comes along (#{c.encoding.inspect})")
+check(a.kind == :put && a.put? && !a.delete?, "kind :put")
+check(a.timestamp.nil?, "no timestamp between two zenoh-pico peers (no router)")
+check(a.to_s == "pz/out/ej: \xff\xd8jpeg" && a.text == a.payload, "Sample#to_s, #text")
+check(Z::Sample.new("k", "v", nil) == Z::Sample.new("k", "v"), "Sample.new(key, payload, attachment)")
+check(sub.received >= 3 && sub.pending == 0, "each_sample takes from the each_pending queue")
+s.put("pz/in/ek", "blk", encoding: "text/plain")
+check(wait_for(s) { sub.pending == 1 }, "each_sample block form")
+seen = []
+n = sub.each_sample { |x| seen << [x.key, x.encoding] }
+check(n == 1 && seen == [["pz/out/ek", "text/plain"]], "each_sample with a block #{n} #{seen.inspect}")
+s.put("pz/in/eo", "old")
+check(wait_for(s) { sub.pending == 1 }, "each_pending after an encoding")
+check(sub.each_pending == [["pz/out/eo", "old", nil]], "each_pending keeps [key, payload, attachment]")
+raises(TypeError, "encoding not a String") { s.put("pz/in/x", "v", encoding: 17) }
+raises(ArgumentError, "unknown keyword on put") { s.put("pz/in/x", "v", priority: :data) }
+check(s.put("pz/in/en2", "v", encoding: nil).nil?, "encoding: nil is no encoding")
+check(wait_for(s) { sub.pending == 1 } && sub.each_sample[0].encoding == "zenoh/bytes", "encoding: nil echoes as zenoh/bytes")
+
+# A declared publisher (CRuby's name: Session#publisher, Publisher#close).
+pub = s.publisher("pz/in/viapub", encoding: "image/png")
+check(pub.is_a?(Z::Publisher) && !pub.closed?, "publisher declared")
+# The publisher's write filter learns of the listener's subscriber first.
+arrived = wait_for(s) { pub.put("p0", attachment: "\x00\x01"); sub.pending >= 1 }
+check(arrived, "a publisher's put arrives")
+wait_for(s, 0.5) { false } # the other p0 in flight
+sub.each_pending
+pub.put("p1", attachment: "\x02")
+pub.put("p2", encoding: "text/csv")
+pub.put("p3")
+check(wait_for(s) { sub.pending == 3 }, "three through the publisher (pending #{sub.pending})")
+got = sub.each_sample.map { |x| [x.key, x.payload, x.attachment, x.encoding] }
+check(got == [["pz/out/viapub", "p1", "\x02", "image/png"], ["pz/out/viapub", "p2", nil, "text/csv"],
+              ["pz/out/viapub", "p3", nil, "image/png"]],
+      "publisher: its encoding, a put's own, the attachment #{got.inspect}")
+raises(TypeError, "publisher encoding not a String") { s.publisher("pz/in/x", encoding: :png) }
+raises(ArgumentError, "publisher bad key") { s.publisher("pz/bad//key") }
+pub.close
+check(pub.closed?, "publisher closed")
+pub.close
+raises(Z::Error, "put on a closed publisher") { pub.put("x") }
+pub2 = s.publisher("pz/in/viapub")
+pub2.put("q") # the write filter may still drop it (no match learnt yet)
+check(wait_for(s) { pub2.put("q"); sub.pending >= 1 }, "a publisher without an encoding")
+check(sub.each_sample.all? { |x| x.encoding == "image/png" }, "the listener's own publisher puts image/png")
+# pub2 stays open: Session#close undeclares it (checked at the end).
+
+# get: each_result gives Replies (zenoh-pico keeps no error replies).
+g = s.get("pz/q/enc", payload: "x")
+check(wait_for(s) { g.done? }, "get for each_result")
+rs = g.each_result
+check(rs.size == 1 && rs[0].is_a?(Z::Reply) && rs[0].ok? && !rs[0].error? && rs[0].key == "pz/q/enc" &&
+      rs[0].payload == "re:x::pz/q/**" && rs[0].encoding == "zenoh/bytes" && rs[0].timestamp.nil?,
+      "each_result #{rs.inspect}")
+g = s.get("pz/q/enc2")
+check(wait_for(s) { g.done? }, "get for each_result with a block")
+n = g.each_result { |r| seen = r.kind }
+check(n == 1 && seen == :put, "each_result with a block (kind #{seen.inspect})")
+
+# Timestamp from its parts (a router stamps samples; checked against one
+# outside this test).
+ts = Z::Timestamp.new((1_700_000_000 << 32) | (1 << 31), "abc")
+check(ts.ntp64 >> 32 == 1_700_000_000 && ts.id == "abc", "Timestamp parts")
+check(ts == Z::Timestamp.new(ts.ntp64, "abc") && ts < Z::Timestamp.new(ts.ntp64 + 1, "abc"), "Timestamp compares")
+tm = ts.to_time
+check(tm.to_i == 1_700_000_000 && tm.usec == 500_000, "Timestamp#to_time #{tm.to_i} #{tm.usec}")
+
 # ---- queue depths: a burst of replies -------------------------------------------
 BURST = 40 # listener.rb answers pz/q/burst/** with this many, and holds as many tokens
 check(Z::DEFAULT_DEPTH == 16 && Z::DEFAULT_GET_DEPTH == 16 && Z::DEFAULT_WATCH_DEPTH == 16 &&
@@ -328,6 +409,8 @@ raises(Z::ClosedError, "put on a closed session") { s.put("pz/in/x", "y") }
 s.close
 s.close
 check(s.connection_count == 0, "no connections after close")
+check(pub2.closed?, "Session#close undeclared the publisher left open")
+raises(Z::Error, "put on a publisher of a closed session") { pub2.put("x") }
 v = Z::Session.open(nil, mode: :peer, listen: "tcp/127.0.0.1:#{port}") { |s2| s2.closed? ? :closed : :open }
 check(v == :open, "open with a block returns the block's value")
 

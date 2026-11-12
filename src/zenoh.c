@@ -2,9 +2,12 @@
  * picoruby-asterism-zenoh: a thin Ruby layer over zenoh-pico (Asterism::Zenoh).
  *
  * Covers: sessions (client, or peer with an optional listener), put /
- * subscribe, get / queryable (query and reply), liveliness tokens and
- * liveliness watches. Samples, queries and replies may carry an attachment
- * (Zenoh's per-message metadata; ROS 2's rmw_zenoh needs it on all three).
+ * subscribe, declared publishers, get / queryable (query and reply),
+ * liveliness tokens and liveliness watches. Samples, queries and replies
+ * may carry an attachment (Zenoh's per-message metadata; ROS 2's rmw_zenoh
+ * needs it on all three). Puts may give an encoding; received samples and
+ * replies keep theirs and the timestamp a router (or the sender) put on
+ * them (each_sample / each_result: mrblib/pico.rb's Sample and Reply).
  *
  * Threading model: zenoh-pico is built single-threaded, so nothing happens
  * behind the interpreter's back. The application calls Session#poll from its
@@ -59,11 +62,11 @@
  * Lifetime: closing is optional. The Ruby objects close their zenoh-pico
  * counterparts when they are freed, in any order (an interpreter shutdown
  * frees objects in no particular order): a session keeps lists of its live
- * subscribers, queryables and tokens and undeclares them before it closes,
- * and detaches them so a later free does not touch the freed session. A get
- * is owned jointly by its Ruby object and zenoh-pico (which calls the reply
- * closure's drop when the query is finished or times out); whichever lets go
- * last frees it.
+ * subscribers, publishers, queryables and tokens and undeclares them before
+ * it closes, and detaches them so a later free does not touch the freed
+ * session. A get is owned jointly by its Ruby object and zenoh-pico (which
+ * calls the reply closure's drop when the query is finished or times out);
+ * whichever lets go last frees it.
  */
 #include <stdarg.h>
 #include <stdbool.h>
@@ -106,6 +109,7 @@
 typedef struct zrb_sub zrb_sub;
 typedef struct zrb_qable zrb_qable;
 typedef struct zrb_token zrb_token;
+typedef struct zrb_pub zrb_pub;
 
 typedef struct {
     z_owned_session_t session;
@@ -115,16 +119,22 @@ typedef struct {
     zrb_sub *subs;  /* live subscribers and liveliness watches */
     zrb_qable *qables;
     zrb_token *tokens;
+    zrb_pub *pubs;
     char *ns;      /* the key namespace (mrb_malloc), or NULL: see "Namespace" at the top */
     size_t ns_len;
 } zrb_session;
 
+/* The bytes of a timestamp kept in an entry: NTP64 time, then the ID. */
+#define ZRB_TS_LEN (8 + ZENOH_ID_SIZE)
+
 typedef struct {
-    uint8_t *buf; /* key, payload and attachment bytes, in that order (z_malloc) */
+    uint8_t *buf; /* key, payload, attachment, encoding and timestamp bytes, in that order (z_malloc) */
     size_t key_len;
     size_t payload_len;
-    size_t att_len; /* 0: the sample had no attachment */
-    bool alive;     /* liveliness watches: the token appeared (true) or went away */
+    size_t att_len;   /* 0: the sample had no attachment */
+    bool alive;       /* liveliness watches: the token appeared (true) or went away; samples: a PUT (true) or a DELETE */
+    bool has_ts;      /* ZRB_TS_LEN timestamp bytes follow the encoding */
+    uint16_t enc_len; /* 0: the default encoding (zenoh/bytes) */
 } zrb_entry;
 
 /* A bounded queue of received values (key + payload). */
@@ -170,6 +180,16 @@ struct zrb_token {
     zrb_token *next;
 };
 
+/* A declared publisher. zenoh-pico declares its key (sent as a number
+ * afterwards) and keeps a write filter: a put that no subscriber matches is
+ * not sent. */
+struct zrb_pub {
+    z_owned_publisher_t pub;
+    bool declared;
+    zrb_session *owner;
+    zrb_pub *next;
+};
+
 /* A get in flight. Allocated with z_malloc (not the mruby allocator): the
  * reply closure's drop may run after the Ruby object, or the whole VM, has
  * gone. */
@@ -191,6 +211,7 @@ static void zrb_session_free(mrb_state *mrb, void *p);
 static void zrb_sub_free(mrb_state *mrb, void *p);
 static void zrb_qable_free(mrb_state *mrb, void *p);
 static void zrb_token_free(mrb_state *mrb, void *p);
+static void zrb_pub_free(mrb_state *mrb, void *p);
 static void zrb_get_free(mrb_state *mrb, void *p);
 static void zrb_query_free(mrb_state *mrb, void *p);
 
@@ -198,6 +219,7 @@ static const struct mrb_data_type zrb_session_type = {"Asterism::Zenoh::Session"
 static const struct mrb_data_type zrb_sub_type = {"Asterism::Zenoh::Subscriber", zrb_sub_free};
 static const struct mrb_data_type zrb_qable_type = {"Asterism::Zenoh::Queryable", zrb_qable_free};
 static const struct mrb_data_type zrb_token_type = {"Asterism::Zenoh::LivelinessToken", zrb_token_free};
+static const struct mrb_data_type zrb_pub_type = {"Asterism::Zenoh::Publisher", zrb_pub_free};
 static const struct mrb_data_type zrb_get_type = {"Asterism::Zenoh::Get", zrb_get_free};
 static const struct mrb_data_type zrb_query_type = {"Asterism::Zenoh::Query", zrb_query_free};
 
@@ -338,10 +360,28 @@ static bool zrb_read_bytes(const z_loaned_bytes_t *b, uint8_t *dst, size_t len) 
     return z_bytes_reader_read(&reader, dst, len) == len;
 }
 
-/* Store key + payload (+ attachment). Called from inside zp_spin_once(): no
- * VM access. */
+/* Whether enc is the default encoding (zenoh/bytes, nothing on the wire). */
+static bool zrb_encoding_is_default(const z_loaned_encoding_t *enc) {
+#if Z_FEATURE_ENCODING_VALUES == 1
+    return z_encoding_equals(enc, z_encoding_loan_default());
+#else
+    return enc->id == 0 && _z_string_len(&enc->schema) == 0;
+#endif
+}
+
+/* What a sample carries besides its key, payload and attachment. */
+typedef struct {
+    const z_loaned_encoding_t *encoding; /* NULL: none to keep */
+    const z_timestamp_t *timestamp;      /* NULL: none */
+    bool alive;
+} zrb_sample_meta;
+
+/* Store key + payload (+ attachment, encoding, timestamp). Called from
+ * inside zp_spin_once(): no VM access. A default encoding takes no room:
+ * it is the common case (Asterism's MessagePack values carry none). */
 static void zrb_ring_push(zrb_ring *r, const char *ns, size_t ns_len, const z_loaned_keyexpr_t *keyexpr,
-                          const z_loaned_bytes_t *payload, const z_loaned_bytes_t *attachment, bool alive) {
+                          const z_loaned_bytes_t *payload, const z_loaned_bytes_t *attachment,
+                          const zrb_sample_meta *meta) {
     z_view_string_t ks;
     if (z_keyexpr_as_view_string(keyexpr, &ks) != Z_OK) {
         r->dropped++;
@@ -355,18 +395,46 @@ static void zrb_ring_push(zrb_ring *r, const char *ns, size_t ns_len, const z_lo
     }
     size_t plen = (payload == NULL) ? 0 : z_bytes_len(payload);
     size_t alen = (attachment == NULL) ? 0 : z_bytes_len(attachment);
+    z_owned_string_t enc_str;
+    z_internal_string_null(&enc_str);
+    size_t elen = 0;
+    if (meta->encoding != NULL && !zrb_encoding_is_default(meta->encoding)) {
+        if (z_encoding_to_string(meta->encoding, &enc_str) != Z_OK) {
+            r->dropped++;
+            return;
+        }
+        elen = z_string_len(z_loan(enc_str));
+        if (elen > UINT16_MAX) {
+            z_drop(z_move(enc_str));
+            r->dropped++;
+            return;
+        }
+    }
+    size_t tlen = (meta->timestamp != NULL) ? ZRB_TS_LEN : 0;
 
-    uint8_t *buf = (uint8_t *)z_malloc(kl + plen + alen + 1);
+    uint8_t *buf = (uint8_t *)z_malloc(kl + plen + alen + elen + tlen + 1);
     if (buf == NULL) {
+        z_drop(z_move(enc_str));
         r->dropped++;
         return;
     }
     memcpy(buf, kd, kl);
     if ((plen > 0 && !zrb_read_bytes(payload, buf + kl, plen)) ||
         (alen > 0 && !zrb_read_bytes(attachment, buf + kl + plen, alen))) {
+        z_drop(z_move(enc_str));
         z_free(buf);
         r->dropped++;
         return;
+    }
+    if (elen > 0) {
+        memcpy(buf + kl + plen + alen, z_string_data(z_loan(enc_str)), elen);
+    }
+    z_drop(z_move(enc_str));
+    if (tlen > 0) {
+        uint64_t t = z_timestamp_ntp64_time(meta->timestamp);
+        z_id_t id = z_timestamp_id(meta->timestamp);
+        memcpy(buf + kl + plen + alen + elen, &t, 8);
+        memcpy(buf + kl + plen + alen + elen + 8, id.id, ZENOH_ID_SIZE);
     }
 
     if (r->count == r->depth) {
@@ -382,23 +450,71 @@ static void zrb_ring_push(zrb_ring *r, const char *ns, size_t ns_len, const z_lo
     r->slots[idx].key_len = kl;
     r->slots[idx].payload_len = plen;
     r->slots[idx].att_len = alen;
-    r->slots[idx].alive = alive;
+    r->slots[idx].alive = meta->alive;
+    r->slots[idx].has_ts = (tlen > 0);
+    r->slots[idx].enc_len = (uint16_t)elen;
     r->count++;
     r->received++;
 }
 
 /* What an entry is turned into by zrb_ring_take. */
 typedef enum {
-    ZRB_TAKE_SAMPLE,     /* subscriber: [key, payload, attachment or nil] */
-    ZRB_TAKE_LIVELINESS, /* liveliness watch: [key, alive] */
-    ZRB_TAKE_REPLY,      /* get: [key, payload, attachment or nil] */
+    ZRB_TAKE_SAMPLE,       /* subscriber: [key, payload, attachment or nil] */
+    ZRB_TAKE_LIVELINESS,   /* liveliness watch: [key, alive] */
+    ZRB_TAKE_REPLY,        /* get: [key, payload, attachment or nil] */
+    ZRB_TAKE_SAMPLE_VALUE, /* subscriber: an Asterism::Zenoh::Sample */
+    ZRB_TAKE_REPLY_VALUE,  /* get: an Asterism::Zenoh::Reply */
 } zrb_take_kind;
+
+/* The name of zenoh's default encoding, as zenoh-c and zenoh-pico print it. */
+#define ZRB_DEFAULT_ENCODING "zenoh/bytes"
+
+/* An Asterism::Zenoh::Timestamp from the bytes kept in an entry. */
+static mrb_value zrb_ts_value(mrb_state *mrb, const uint8_t *p) {
+    uint64_t t;
+    z_id_t id;
+    memcpy(&t, p, 8);
+    memcpy(id.id, p + 8, ZENOH_ID_SIZE);
+    z_owned_string_t str;
+    if (z_id_to_string(&id, &str) != Z_OK) {
+        mrb_raise(mrb, zrb_error_class(mrb), "cannot format the timestamp's ID");
+    }
+    mrb_value args[2];
+    /* NTP64 fits an mrb_int (64 bits) until 2038; past that, a Float. */
+#ifndef MRB_NO_FLOAT
+    args[0] = (t > (uint64_t)MRB_INT_MAX) ? mrb_float_value(mrb, (mrb_float)t) : mrb_int_value(mrb, (mrb_int)t);
+#else
+    args[0] = mrb_int_value(mrb, (mrb_int)t);
+#endif
+    args[1] = zrb_str_from_view(mrb, z_loan(str));
+    z_drop(z_move(str));
+    return mrb_obj_new(mrb, zrb_class(mrb, "Timestamp"), 2, args);
+}
+
+/* Sample.new / Reply.new (mrblib/pico.rb) with the positional members the
+ * zenoh-pico binding fills: key, payload, attachment, kind, encoding,
+ * timestamp. */
+static mrb_value zrb_entry_value(mrb_state *mrb, const zrb_entry *e, const char *cls) {
+    mrb_value args[6];
+    const uint8_t *p = e->buf;
+    args[0] = mrb_str_new(mrb, (const char *)p, (mrb_int)e->key_len);
+    p += e->key_len;
+    args[1] = mrb_str_new(mrb, (const char *)p, (mrb_int)e->payload_len);
+    p += e->payload_len;
+    args[2] = (e->att_len > 0) ? mrb_str_new(mrb, (const char *)p, (mrb_int)e->att_len) : mrb_nil_value();
+    p += e->att_len;
+    args[3] = mrb_symbol_value(e->alive ? mrb_intern_lit(mrb, "put") : mrb_intern_lit(mrb, "delete"));
+    args[4] = (e->enc_len > 0) ? mrb_str_new(mrb, (const char *)p, (mrb_int)e->enc_len)
+                               : mrb_str_new_lit(mrb, ZRB_DEFAULT_ENCODING);
+    p += e->enc_len;
+    args[5] = e->has_ts ? zrb_ts_value(mrb, p) : mrb_nil_value();
+    return mrb_obj_new(mrb, zrb_class(mrb, cls), 6, args);
+}
 
 /* Take out what is pending now, oldest first: yield them to blk, or collect
  * them into an Array when blk is nil (shapes: zrb_take_kind). Values that
  * arrive while the block runs (it may poll) are left for the next call. */
 static mrb_value zrb_ring_take(mrb_state *mrb, zrb_ring *r, mrb_value blk, zrb_take_kind kind) {
-    bool liveliness = (kind == ZRB_TAKE_LIVELINESS);
     bool collect = mrb_nil_p(blk);
     mrb_value out = collect ? mrb_ary_new(mrb) : mrb_nil_value();
     mrb_int taken = 0;
@@ -411,17 +527,28 @@ static mrb_value zrb_ring_take(mrb_state *mrb, zrb_ring *r, mrb_value blk, zrb_t
          * ring) instead of leaking. */
         zrb_entry e = r->slots[r->head];
         mrb_value vals[3];
-        mrb_int n = liveliness ? 2 : 3;
-        vals[0] = mrb_str_new(mrb, (const char *)e.buf, (mrb_int)e.key_len);
-        if (liveliness) {
+        mrb_int n;
+        switch (kind) {
+        case ZRB_TAKE_LIVELINESS:
+            n = 2;
+            vals[0] = mrb_str_new(mrb, (const char *)e.buf, (mrb_int)e.key_len);
             vals[1] = mrb_bool_value(e.alive);
-        } else {
+            break;
+        case ZRB_TAKE_SAMPLE_VALUE:
+        case ZRB_TAKE_REPLY_VALUE:
+            n = 1;
+            vals[0] = zrb_entry_value(mrb, &e, kind == ZRB_TAKE_SAMPLE_VALUE ? "Sample" : "Reply");
+            break;
+        default:
+            n = 3;
+            vals[0] = mrb_str_new(mrb, (const char *)e.buf, (mrb_int)e.key_len);
             vals[1] = mrb_str_new(mrb, (const char *)e.buf + e.key_len, (mrb_int)e.payload_len);
             if (e.att_len > 0) {
                 vals[2] = mrb_str_new(mrb, (const char *)e.buf + e.key_len + e.payload_len, (mrb_int)e.att_len);
             } else {
                 vals[2] = mrb_nil_value();
             }
+            break;
         }
         r->slots[r->head].buf = NULL;
         r->head = (r->head + 1) % r->depth;
@@ -429,7 +556,9 @@ static mrb_value zrb_ring_take(mrb_state *mrb, zrb_ring *r, mrb_value blk, zrb_t
         z_free(e.buf);
         taken++;
         if (collect) {
-            mrb_ary_push(mrb, out, mrb_ary_new_from_values(mrb, n, vals));
+            mrb_ary_push(mrb, out, n == 1 ? vals[0] : mrb_ary_new_from_values(mrb, n, vals));
+        } else if (n == 1) {
+            mrb_yield(mrb, blk, vals[0]);
         } else {
             mrb_yield_argv(mrb, blk, n, vals);
         }
@@ -446,13 +575,15 @@ static void zrb_on_sample(z_loaned_sample_t *sample, void *ctx) {
     if (s == NULL || s->ring.slots == NULL) {
         return;
     }
+    /* A token appearing is a PUT, one going away a DELETE. */
+    zrb_sample_meta meta = {NULL, NULL, z_sample_kind(sample) == Z_SAMPLE_KIND_PUT};
     if (s->liveliness) {
-        /* A token appearing is a PUT, one going away a DELETE. */
-        zrb_ring_push(&s->ring, s->ns, s->ns_len, z_sample_keyexpr(sample), NULL, NULL,
-                      z_sample_kind(sample) == Z_SAMPLE_KIND_PUT);
+        zrb_ring_push(&s->ring, s->ns, s->ns_len, z_sample_keyexpr(sample), NULL, NULL, &meta);
     } else {
+        meta.encoding = z_sample_encoding(sample);
+        meta.timestamp = z_sample_timestamp(sample);
         zrb_ring_push(&s->ring, s->ns, s->ns_len, z_sample_keyexpr(sample), z_sample_payload(sample),
-                      z_sample_attachment(sample), true);
+                      z_sample_attachment(sample), &meta);
     }
 }
 
@@ -506,6 +637,19 @@ static mrb_value zrb_sub_each_pending(mrb_state *mrb, mrb_value self) {
     mrb_get_args(mrb, "&", &blk);
     zrb_sub *s = zrb_sub_get(mrb, self);
     return zrb_ring_take(mrb, &s->ring, blk, s->liveliness ? ZRB_TAKE_LIVELINESS : ZRB_TAKE_SAMPLE);
+}
+
+/* sub.each_sample { |sample| ... } -> Integer; without a block, Array of
+ * Asterism::Zenoh::Sample (key, payload, attachment, kind, encoding,
+ * timestamp). Takes from the same queue as each_pending. */
+static mrb_value zrb_sub_each_sample(mrb_state *mrb, mrb_value self) {
+    mrb_value blk = mrb_nil_value();
+    mrb_get_args(mrb, "&", &blk);
+    zrb_sub *s = zrb_sub_get(mrb, self);
+    if (s->liveliness) {
+        mrb_raise(mrb, E_NOTIMP_ERROR, "a liveliness watch has no samples (each_pending)");
+    }
+    return zrb_ring_take(mrb, &s->ring, blk, ZRB_TAKE_SAMPLE_VALUE);
 }
 
 static mrb_value zrb_sub_pending(mrb_state *mrb, mrb_value self) {
@@ -827,6 +971,54 @@ static void zrb_bytes_from_str(mrb_state *mrb, z_owned_bytes_t *out, mrb_value s
     }
 }
 
+/* The optional encoding: keyword of put / publisher: nil or a String, the
+ * name zenoh prints ("image/jpeg", "text/plain;charset=utf-8"); nil sends
+ * none (the default encoding, nothing on the wire). */
+static mrb_value zrb_kw_encoding(mrb_state *mrb, mrb_value v) {
+    mrb_value enc = mrb_undef_p(v) ? mrb_nil_value() : v;
+    if (!mrb_nil_p(enc) && !mrb_string_p(enc)) {
+        mrb_raise(mrb, E_TYPE_ERROR, "encoding must be a String or nil");
+    }
+    return enc;
+}
+
+/* What a put sends: the payload, and the attachment and encoding when given. */
+typedef struct {
+    z_owned_bytes_t payload;
+    z_owned_bytes_t att;
+    z_owned_encoding_t enc;
+    bool has_att;
+    bool has_enc;
+} zrb_put_parts;
+
+/* Fills pp from Ruby values (att and enc nil or Strings, checked). Raises
+ * (holding nothing) when a String has a NUL or memory runs out. */
+static void zrb_put_parts_make(mrb_state *mrb, zrb_put_parts *pp, mrb_value payload, mrb_value att, mrb_value enc) {
+    pp->has_att = false;
+    pp->has_enc = false;
+    const char *enc_s = mrb_nil_p(enc) ? NULL : mrb_string_value_cstr(mrb, &enc);
+    if (z_bytes_copy_from_buf(&pp->payload, (const uint8_t *)RSTRING_PTR(payload), (size_t)RSTRING_LEN(payload)) != Z_OK) {
+        mrb_raise(mrb, zrb_error_class(mrb), "cannot allocate the payload");
+    }
+    if (!mrb_nil_p(att)) {
+        if (z_bytes_copy_from_buf(&pp->att, (const uint8_t *)RSTRING_PTR(att), (size_t)RSTRING_LEN(att)) != Z_OK) {
+            z_drop(z_move(pp->payload));
+            mrb_raise(mrb, zrb_error_class(mrb), "cannot allocate the attachment");
+        }
+        pp->has_att = true;
+    }
+    if (enc_s != NULL) {
+        if (z_encoding_from_str(&pp->enc, enc_s) != Z_OK) {
+            z_drop(z_move(pp->payload));
+            if (pp->has_att) {
+                z_drop(z_move(pp->att));
+            }
+            mrb_raise(mrb, zrb_error_class(mrb), "cannot allocate the encoding");
+        }
+        pp->has_enc = true;
+    }
+}
+
 /* q.reply(payload, attachment: nil) / q.reply(key, payload, attachment: nil)
  * -> nil. The key defaults to the query's key; it must match the query's key
  * expression. May be called more than once before the query is finished. */
@@ -906,8 +1098,10 @@ static void zrb_on_reply(z_loaned_reply_t *reply, void *ctx) {
     }
     if (z_reply_is_ok(reply)) {
         const z_loaned_sample_t *sample = z_reply_ok(reply);
+        zrb_sample_meta meta = {z_sample_encoding(sample), z_sample_timestamp(sample),
+                                z_sample_kind(sample) == Z_SAMPLE_KIND_PUT};
         zrb_ring_push(&g->ring, g->ns, g->ns_len, z_sample_keyexpr(sample), z_sample_payload(sample),
-                      z_sample_attachment(sample), true);
+                      z_sample_attachment(sample), &meta);
     } else {
         g->errors++;
     }
@@ -981,6 +1175,16 @@ static mrb_value zrb_get_each_reply(mrb_state *mrb, mrb_value self) {
     return zrb_ring_take(mrb, &zrb_get_get(mrb, self)->ring, blk, ZRB_TAKE_REPLY);
 }
 
+/* g.each_result { |reply| ... } -> Integer; without a block, Array of
+ * Asterism::Zenoh::Reply (key, payload, attachment, kind, encoding,
+ * timestamp). Takes from the same queue as each_reply. zenoh-pico's error
+ * replies are not kept (errors counts them), so every Reply here is ok?. */
+static mrb_value zrb_get_each_result(mrb_state *mrb, mrb_value self) {
+    mrb_value blk = mrb_nil_value();
+    mrb_get_args(mrb, "&", &blk);
+    return zrb_ring_take(mrb, &zrb_get_get(mrb, self)->ring, blk, ZRB_TAKE_REPLY_VALUE);
+}
+
 static mrb_value zrb_get_done_p(mrb_state *mrb, mrb_value self) {
     return mrb_bool_value(zrb_get_get(mrb, self)->done);
 }
@@ -1048,6 +1252,53 @@ static mrb_value zrb_token_closed_p(mrb_state *mrb, mrb_value self) {
     return mrb_bool_value(!zrb_token_get(mrb, self)->declared);
 }
 
+/* ------------------------------------------------------------- publisher */
+
+static void zrb_pub_detach(zrb_pub *p) {
+    if (p->declared) {
+        z_drop(z_move(p->pub));
+        p->declared = false;
+    }
+    if (p->owner != NULL) {
+        zrb_pub **pp = &p->owner->pubs;
+        while (*pp != NULL) {
+            if (*pp == p) {
+                *pp = p->next;
+                break;
+            }
+            pp = &(*pp)->next;
+        }
+        p->owner = NULL;
+        p->next = NULL;
+    }
+}
+
+static void zrb_pub_free(mrb_state *mrb, void *p) {
+    zrb_pub *pb = (zrb_pub *)p;
+    if (pb == NULL) {
+        return;
+    }
+    zrb_pub_detach(pb);
+    mrb_free(mrb, pb);
+}
+
+static zrb_pub *zrb_pub_get(mrb_state *mrb, mrb_value self) {
+    zrb_pub *p = (zrb_pub *)mrb_data_get_ptr(mrb, self, &zrb_pub_type);
+    if (p == NULL) {
+        mrb_raise(mrb, E_RUNTIME_ERROR, "uninitialized Asterism::Zenoh::Publisher");
+    }
+    return p;
+}
+
+static mrb_value zrb_pub_close(mrb_state *mrb, mrb_value self) {
+    zrb_pub_detach(zrb_pub_get(mrb, self));
+    return mrb_nil_value();
+}
+
+static mrb_value zrb_pub_closed_p(mrb_state *mrb, mrb_value self) {
+    return mrb_bool_value(!zrb_pub_get(mrb, self)->declared);
+}
+
 /* --------------------------------------------------------------- session */
 
 static void zrb_session_shutdown(zrb_session *z) {
@@ -1061,6 +1312,9 @@ static void zrb_session_shutdown(zrb_session *z) {
     }
     while (z->subs != NULL) {
         zrb_sub_detach(z->subs);
+    }
+    while (z->pubs != NULL) {
+        zrb_pub_detach(z->pubs);
     }
     if (z->open) {
         /* Pending gets are dropped here (their drop callback marks them done). */
@@ -1349,43 +1603,126 @@ static mrb_value zrb_session_s_open(mrb_state *mrb, mrb_value klass) {
     return obj;
 }
 
-/* session.put(key, payload, attachment: nil) -> nil */
-static mrb_value zrb_session_put(mrb_state *mrb, mrb_value self) {
-    const char *key;
-    mrb_value payload;
-    mrb_sym kw_names[1] = {mrb_intern_lit(mrb, "attachment")};
-    mrb_value kw_values[1];
-    mrb_kwargs kwargs = {1, 0, kw_names, kw_values, NULL};
-    mrb_get_args(mrb, "zS:", &key, &payload, &kwargs);
-    mrb_value att = zrb_kw_attachment(mrb, kw_values[0]);
-    zrb_session *z = zrb_session_get_open(mrb, self);
-
-    z_view_keyexpr_t ke;
-    zrb_view_key(mrb, &ke, zrb_ns_key(mrb, z->ns, z->ns_len, key));
-    z_owned_bytes_t bytes;
-    if (z_bytes_copy_from_buf(&bytes, (const uint8_t *)RSTRING_PTR(payload), (size_t)RSTRING_LEN(payload)) != Z_OK) {
-        mrb_raise(mrb, zrb_error_class(mrb), "cannot allocate the payload");
-    }
-    z_put_options_t opts;
-    z_put_options_default(&opts);
-    z_owned_bytes_t att_bytes;
-    if (!mrb_nil_p(att)) {
-        if (z_bytes_copy_from_buf(&att_bytes, (const uint8_t *)RSTRING_PTR(att), (size_t)RSTRING_LEN(att)) != Z_OK) {
-            z_drop(z_move(bytes));
-            mrb_raise(mrb, zrb_error_class(mrb), "cannot allocate the attachment");
-        }
-        opts.attachment = z_move(att_bytes);
-    }
-    z_result_t ret = z_put(z_loan(z->session), z_loan(ke), z_move(bytes), &opts);
+/* After a put (of the session or of a publisher) that returned ret: raises
+ * ClosedError when the connection is lost, nothing while zenoh-pico opens
+ * it again (the value is dropped, as a router that is away would), Error
+ * on another failure. */
+static void zrb_put_result(mrb_state *mrb, zrb_session *z, z_result_t ret) {
     if (zrb_session_check_link(z)) {
         zrb_raise_code(mrb, zrb_closed_class(mrb), (int)ret, "put failed: the connection is lost (%d)", (int)ret);
     }
     if (ret != Z_OK && zrb_session_reconnecting(z)) {
-        return mrb_nil_value(); /* nobody to send it to until the router is back */
+        return; /* nobody to send it to until the router is back */
     }
     if (ret != Z_OK) {
         zrb_raise_code(mrb, zrb_error_class(mrb), (int)ret, "put failed (%d)", (int)ret);
     }
+}
+
+/* session.put(key, payload, attachment: nil, encoding: nil) -> nil */
+static mrb_value zrb_session_put(mrb_state *mrb, mrb_value self) {
+    const char *key;
+    mrb_value payload;
+    mrb_sym kw_names[2] = {mrb_intern_lit(mrb, "attachment"), mrb_intern_lit(mrb, "encoding")};
+    mrb_value kw_values[2];
+    mrb_kwargs kwargs = {2, 0, kw_names, kw_values, NULL};
+    mrb_get_args(mrb, "zS:", &key, &payload, &kwargs);
+    mrb_value att = zrb_kw_attachment(mrb, kw_values[0]);
+    mrb_value enc = zrb_kw_encoding(mrb, kw_values[1]);
+    zrb_session *z = zrb_session_get_open(mrb, self);
+
+    z_view_keyexpr_t ke;
+    zrb_view_key(mrb, &ke, zrb_ns_key(mrb, z->ns, z->ns_len, key));
+    zrb_put_parts pp;
+    zrb_put_parts_make(mrb, &pp, payload, att, enc);
+    z_put_options_t opts;
+    z_put_options_default(&opts);
+    if (pp.has_att) {
+        opts.attachment = z_move(pp.att);
+    }
+    if (pp.has_enc) {
+        opts.encoding = z_move(pp.enc);
+    }
+    z_result_t ret = z_put(z_loan(z->session), z_loan(ke), z_move(pp.payload), &opts);
+    zrb_put_result(mrb, z, ret);
+    return mrb_nil_value();
+}
+
+/* session.publisher(key, encoding: nil) -> Publisher. encoding: the
+ * publisher's own (each put may give another); nil: none (the default
+ * encoding). Undeclared by close, when collected, or when the session
+ * closes. */
+static mrb_value zrb_session_publisher(mrb_state *mrb, mrb_value self) {
+    const char *key;
+    mrb_sym kw_names[1] = {mrb_intern_lit(mrb, "encoding")};
+    mrb_value kw_values[1];
+    mrb_kwargs kwargs = {1, 0, kw_names, kw_values, NULL};
+    mrb_get_args(mrb, "z:", &key, &kwargs);
+    mrb_value enc = zrb_kw_encoding(mrb, kw_values[0]);
+    zrb_session *z = zrb_session_get_open(mrb, self);
+    z_view_keyexpr_t ke;
+    zrb_view_key(mrb, &ke, zrb_ns_key(mrb, z->ns, z->ns_len, key));
+    const char *enc_s = mrb_nil_p(enc) ? NULL : mrb_string_value_cstr(mrb, &enc);
+
+    struct RData *data = mrb_data_object_alloc(mrb, zrb_class(mrb, "Publisher"), NULL, &zrb_pub_type);
+    zrb_pub *p = (zrb_pub *)mrb_malloc(mrb, sizeof(zrb_pub));
+    memset(p, 0, sizeof(*p));
+    data->data = p;
+    mrb_value obj = mrb_obj_value(data);
+
+    z_publisher_options_t opts;
+    z_publisher_options_default(&opts);
+    z_owned_encoding_t enc_o;
+    if (enc_s != NULL) {
+        if (z_encoding_from_str(&enc_o, enc_s) != Z_OK) {
+            mrb_raise(mrb, zrb_error_class(mrb), "cannot allocate the encoding");
+        }
+        opts.encoding = z_move(enc_o);
+    }
+    z_result_t ret = z_declare_publisher(z_loan(z->session), &p->pub, z_loan(ke), &opts);
+    if (ret != Z_OK) {
+        zrb_raise_code(mrb, zrb_error_class(mrb), (int)ret, "cannot declare a publisher on %s (%d)", key, (int)ret);
+    }
+    p->declared = true;
+    p->owner = z;
+    p->next = z->pubs;
+    z->pubs = p;
+    zrb_hold_session(mrb, obj, self, key);
+    return obj;
+}
+
+/* pub.put(payload, attachment: nil, encoding: nil) -> nil. encoding: nil
+ * sends the publisher's own. Raises Error once the publisher is closed;
+ * otherwise as session.put. */
+static mrb_value zrb_pub_put(mrb_state *mrb, mrb_value self) {
+    mrb_value payload;
+    mrb_sym kw_names[2] = {mrb_intern_lit(mrb, "attachment"), mrb_intern_lit(mrb, "encoding")};
+    mrb_value kw_values[2];
+    mrb_kwargs kwargs = {2, 0, kw_names, kw_values, NULL};
+    mrb_get_args(mrb, "S:", &payload, &kwargs);
+    mrb_value att = zrb_kw_attachment(mrb, kw_values[0]);
+    mrb_value enc = zrb_kw_encoding(mrb, kw_values[1]);
+    zrb_pub *p = zrb_pub_get(mrb, self);
+    if (!p->declared || p->owner == NULL) {
+        mrb_raise(mrb, zrb_error_class(mrb), "the publisher is closed");
+    }
+    zrb_session *z = p->owner;
+    if (zrb_session_check_link(z)) {
+        /* The session closed (and detached this publisher). */
+        mrb_raise(mrb, zrb_closed_class(mrb), "session is closed");
+    }
+    zrb_put_parts pp;
+    zrb_put_parts_make(mrb, &pp, payload, att, enc);
+    z_publisher_put_options_t opts;
+    z_publisher_put_options_default(&opts);
+    if (pp.has_att) {
+        opts.attachment = z_move(pp.att);
+    }
+    if (pp.has_enc) {
+        opts.encoding = z_move(pp.enc);
+    }
+    z_result_t ret = z_publisher_put(z_loan(p->pub), z_move(pp.payload), &opts);
+    zrb_put_result(mrb, z, ret);
     return mrb_nil_value();
 }
 
@@ -1788,7 +2125,8 @@ void mrb_picoruby_asterism_zenoh_gem_init(mrb_state *mrb) {
     MRB_SET_INSTANCE_TT(ses, MRB_TT_CDATA);
     mrb_undef_class_method(mrb, ses, "new");
     mrb_define_class_method(mrb, ses, "open", zrb_session_s_open, MRB_ARGS_OPT(1) | MRB_ARGS_KEY(4, 0));
-    mrb_define_method(mrb, ses, "put", zrb_session_put, MRB_ARGS_REQ(2) | MRB_ARGS_KEY(1, 0));
+    mrb_define_method(mrb, ses, "put", zrb_session_put, MRB_ARGS_REQ(2) | MRB_ARGS_KEY(2, 0));
+    mrb_define_method(mrb, ses, "publisher", zrb_session_publisher, MRB_ARGS_REQ(1) | MRB_ARGS_KEY(1, 0));
     mrb_define_method(mrb, ses, "subscribe", zrb_session_subscribe, MRB_ARGS_ARG(1, 1));
     mrb_define_method(mrb, ses, "get", zrb_session_get_m, MRB_ARGS_ARG(1, 3) | MRB_ARGS_KEY(4, 0));
     mrb_define_method(mrb, ses, "queryable", zrb_session_queryable, MRB_ARGS_ARG(1, 1) | MRB_ARGS_KEY(1, 0));
@@ -1817,6 +2155,7 @@ void mrb_picoruby_asterism_zenoh_gem_init(mrb_state *mrb) {
         mrb_define_method(mrb, both[i], "close", zrb_sub_close, MRB_ARGS_NONE());
         mrb_define_method(mrb, both[i], "closed?", zrb_sub_closed_p, MRB_ARGS_NONE());
     }
+    mrb_define_method(mrb, sub, "each_sample", zrb_sub_each_sample, MRB_ARGS_BLOCK());
 
     struct RClass *qable = mrb_define_class_under(mrb, mod, "Queryable", mrb->object_class);
     MRB_SET_INSTANCE_TT(qable, MRB_TT_CDATA);
@@ -1843,11 +2182,19 @@ void mrb_picoruby_asterism_zenoh_gem_init(mrb_state *mrb) {
     MRB_SET_INSTANCE_TT(get, MRB_TT_CDATA);
     mrb_undef_class_method(mrb, get, "new");
     mrb_define_method(mrb, get, "each_reply", zrb_get_each_reply, MRB_ARGS_BLOCK());
+    mrb_define_method(mrb, get, "each_result", zrb_get_each_result, MRB_ARGS_BLOCK());
     mrb_define_method(mrb, get, "done?", zrb_get_done_p, MRB_ARGS_NONE());
     mrb_define_method(mrb, get, "pending", zrb_get_pending, MRB_ARGS_NONE());
     mrb_define_method(mrb, get, "received", zrb_get_received, MRB_ARGS_NONE());
     mrb_define_method(mrb, get, "dropped", zrb_get_dropped, MRB_ARGS_NONE());
     mrb_define_method(mrb, get, "errors", zrb_get_errors, MRB_ARGS_NONE());
+
+    struct RClass *pub = mrb_define_class_under(mrb, mod, "Publisher", mrb->object_class);
+    MRB_SET_INSTANCE_TT(pub, MRB_TT_CDATA);
+    mrb_undef_class_method(mrb, pub, "new");
+    mrb_define_method(mrb, pub, "put", zrb_pub_put, MRB_ARGS_REQ(1) | MRB_ARGS_KEY(2, 0));
+    mrb_define_method(mrb, pub, "close", zrb_pub_close, MRB_ARGS_NONE());
+    mrb_define_method(mrb, pub, "closed?", zrb_pub_closed_p, MRB_ARGS_NONE());
 
     struct RClass *tok = mrb_define_class_under(mrb, mod, "LivelinessToken", mrb->object_class);
     MRB_SET_INSTANCE_TT(tok, MRB_TT_CDATA);

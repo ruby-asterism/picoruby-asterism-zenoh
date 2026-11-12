@@ -6,8 +6,10 @@
 #
 #   mruby listener.rb PORT
 #
-# - put on pz/in/<name> comes back as pz/out/<name>, same payload and
-#   attachment; pz/in/stop closes this side
+# - put on pz/in/<name> comes back as pz/out/<name>, same payload,
+#   attachment and encoding; pz/in/viapub comes back through a declared
+#   publisher on pz/out/viapub (encoding image/png unless the put gave
+#   another); pz/in/stop closes this side
 # - queries on pz/q/** get one reply: "re:<payload>:<params>:<queryable key>", with the
 #   query's attachment; a query on pz/q/burst/** gets BURST replies at once
 #   (pz/q/burst/k<i>, payload i)
@@ -40,6 +42,7 @@ s = Asterism::Zenoh::Session.open(nil, mode: :peer, listen: "tcp/127.0.0.1:#{por
 sub = s.subscribe("pz/in/**", depth: 64)
 qa = s.queryable("pz/q/**")
 tok = s.liveliness("pz/alive/a")
+vpub = s.publisher("pz/out/viapub", encoding: "image/png")
 burst = []
 BURST.times { |i| burst << s.liveliness("pz/lv/t#{i}") }
 la = Asterism::Zenoh::Session.open(nil, mode: :peer, listen: "tcp/127.0.0.1:#{port.to_i + 1}", namespace: "room/a")
@@ -59,12 +62,16 @@ stop = false
 deadline = Time.now + 120
 until stop || Time.now > deadline
   s.poll
-  sub.each_pending do |key, payload, att|
-    name = key.split("/").last
+  sub.each_sample do |sm|
+    name = sm.key.split("/").last
     if name == "stop"
       stop = true
+    elsif name == "viapub"
+      # zenoh/bytes given explicitly would replace the publisher's own.
+      enc = sm.encoding == "image/png" || sm.encoding == "zenoh/bytes" ? nil : sm.encoding
+      vpub.put(sm.payload, attachment: sm.attachment, encoding: enc)
     else
-      s.put("pz/out/#{name}", payload, attachment: att)
+      s.put("pz/out/#{name}", sm.payload, attachment: sm.attachment, encoding: sm.encoding)
     end
   end
   qa.each_pending do |q|

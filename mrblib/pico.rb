@@ -90,3 +90,136 @@ module Asterism
     end
   end
 end
+
+module Asterism
+  module Zenoh
+    # A received sample, from Subscriber#each_sample: the members CRuby's
+    # Sample starts with, in the same order (Sample.new(key, payload,
+    # attachment) works on both). payload and attachment are Strings
+    # (attachment nil when there was none); kind :put or :delete; encoding
+    # the name zenoh prints ("zenoh/bytes" when the sender gave none,
+    # "image/jpeg", ...); timestamp a Timestamp, or nil (zenoh only stamps
+    # samples when the sender or a router does). The CRuby-only members
+    # (priority, congestion_control, express, reliability, source_zid) are
+    # not here.
+    class Sample
+      attr_reader :key, :payload, :attachment, :kind, :encoding, :timestamp
+
+      def initialize(key, payload, attachment = nil, kind = :put, encoding = nil, timestamp = nil)
+        @key = key
+        @payload = payload
+        @attachment = attachment
+        @kind = kind
+        @encoding = encoding
+        @timestamp = timestamp
+      end
+
+      # The payload as text (Strings carry no encoding here).
+      def text
+        payload.dup
+      end
+
+      def put?
+        kind == :put
+      end
+
+      def delete?
+        kind == :delete
+      end
+
+      def to_h
+        { key: key, payload: payload, attachment: attachment, kind: kind, encoding: encoding, timestamp: timestamp }
+      end
+
+      def deconstruct_keys(_keys)
+        to_h
+      end
+
+      def ==(other)
+        other.is_a?(self.class) && to_h == other.to_h
+      end
+
+      def to_s
+        "#{key}: #{payload}"
+      end
+    end
+
+    # A reply to a get, from Get#each_result: the members of a Sample, and
+    # error (always false here: zenoh-pico's error replies are counted in
+    # Get#errors, not kept) and replier_zid (nil here).
+    class Reply < Sample
+      def error
+        false
+      end
+
+      def replier_zid
+        nil
+      end
+
+      def ok?
+        true
+      end
+
+      def error?
+        false
+      end
+
+      def to_h
+        h = super
+        h[:error] = false
+        h
+      end
+    end
+
+    # The time zenoh put on a sample (zenoh's HLC: a router stamps what
+    # passes through it, by default). ntp64: seconds since 1970 in the upper
+    # 32 bits, the fraction in the lower 32. id: the Zenoh ID of the clock
+    # (hex, as Session#zid).
+    class Timestamp
+      include Comparable
+
+      attr_reader :ntp64, :id
+
+      def initialize(ntp64, id)
+        @ntp64 = ntp64
+        @id = id
+      end
+
+      # A Time (where Time has at(seconds, microseconds)).
+      def to_time
+        sec = ntp64 >> 32
+        usec = ((ntp64 & 0xffffffff) * 1_000_000) >> 32
+        Time.at(sec, usec)
+      end
+
+      # By time, then by ID. (With < and >: mruby's Integer#<=> compares
+      # through Float, which cannot tell two NTP64 times 1 apart.)
+      def <=>(other)
+        return nil unless other.is_a?(Timestamp)
+        return -1 if ntp64 < other.ntp64
+        return 1 if ntp64 > other.ntp64
+        id <=> other.id
+      end
+
+      def ==(other)
+        other.is_a?(Timestamp) && ntp64 == other.ntp64 && id == other.id
+      end
+
+      def hash
+        [ntp64, id].hash
+      end
+
+      def eql?(other)
+        self == other
+      end
+
+      def to_s
+        "#{ntp64}/#{id}"
+      end
+
+      def inspect
+        "#<Asterism::Zenoh::Timestamp #{self}>"
+      end
+    end
+  end
+end
