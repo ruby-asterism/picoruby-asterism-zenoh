@@ -7,6 +7,9 @@
 #   rake build         build mruby with this gem for the host (POSIX platform)
 #   rake test          run host_test/test_zenoh.rb against host_test/listener.rb,
 #                      two mruby processes talking over a local TCP peer link
+#   rake test_cruby    encoding, publishers and the router's timestamps
+#                      against zenoh-c (CRuby + an asterism-zenoh checkout,
+#                      ../asterism-zenoh or ASTERISM_ZENOH_DIR)
 #   rake clean         remove the build (vendor/ stays)
 #
 # Environment overrides: ZENOH_PICO_DIR (a zenoh-pico checkout; mrbgem.rake
@@ -165,6 +168,37 @@ task test_reconnect: :build do
       a.close
     end
     system("docker rm -f #{name} > /dev/null 2>&1")
+  end
+end
+
+desc "Encoding, publishers and the router's timestamps against zenoh-c (needs CRuby and an asterism-zenoh checkout)"
+task test_cruby: :build do
+  bin = mruby_bin
+  dir = ENV["ASTERISM_ZENOH_DIR"].to_s.empty? ? File.expand_path("../asterism-zenoh", ROOT) : File.expand_path(ENV["ASTERISM_ZENOH_DIR"])
+  abort "asterism-zenoh not built at #{dir} (rake compile there, or set ASTERISM_ZENOH_DIR)" unless
+    Dir.glob(File.join(dir, "lib", "asterism", "asterism_zenoh.*")).any?
+  port = free_port
+  router = IO.popen([RbConfig.ruby, "-I", File.join(dir, "lib"), File.join(ROOT, "host_test", "cruby_router.rb"),
+                     port.to_s], err: [:child, :out])
+  begin
+    line = Timeout.timeout(15) { router.gets }
+    abort "cruby_router did not start: #{line.inspect}" unless line&.start_with?("ready")
+    ok = system(bin, File.join(ROOT, "host_test", "cruby_check.rb"), port.to_s)
+    out = Timeout.timeout(25) { router.read }
+    puts out.lines.map { "zenoh-c: #{_1}" }.join
+    want = ['got x/pico/p p1 "\\x01" image/png true', "got x/pico/p p2 nil text/csv true",
+            "got x/pico/s s1 nil application/cdr true", "got x/pico/n s2 nil zenoh/bytes true"]
+    missing = want.reject { |w| out.include?(w) }
+    abort "zenoh-c did not get: #{missing.inspect}" unless missing.empty?
+    abort "test_cruby failed" unless ok
+    puts "test_cruby: ok"
+  ensure
+    begin
+      Process.kill("TERM", router.pid)
+    rescue Errno::ESRCH
+      nil
+    end
+    router.close
   end
 end
 
