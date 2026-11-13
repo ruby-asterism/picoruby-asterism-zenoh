@@ -41,9 +41,16 @@
 #define ZP_SYSTEM_PLATFORM_HEADER "zenoh_espidf_platform.h"
 #endif
 
-/* Buffer sizes: zenoh-pico's defaults (an rx batch plus a fragment buffer). */
+/* Buffer sizes. The batches are zenoh-pico's defaults. Z_FRAG_MAX_SIZE is
+ * the largest message received in fragments (a reply, a value): zenoh-pico's
+ * default 4096 dropped a 4 KB answer as if nobody had answered, so it is
+ * 16384 here. It costs no static RAM: the reassembly buffer is allocated
+ * (z_malloc; PSRAM on ESP-IDF, see ports/esp32/zp_system_esp32.c) when the
+ * first fragment of a message comes, at this size, and freed when the
+ * message is decoded; at most two at once per peer (reliable and best
+ * effort), a client has one (its router). */
 #ifndef Z_FRAG_MAX_SIZE
-#define Z_FRAG_MAX_SIZE 4096
+#define Z_FRAG_MAX_SIZE 16384
 #endif
 #ifndef Z_BATCH_UNICAST_SIZE
 #define Z_BATCH_UNICAST_SIZE 2048

@@ -6,7 +6,8 @@
 #
 # - puts x/cruby/a ("jpeg", image/jpeg, attachment "\x05") and x/cruby/b
 #   (no encoding) again and again, until it has heard from the other side
-# - answers queries on x/q with "ans" (text/plain)
+# - answers queries on x/q with "ans" (text/plain), and on x/big with
+#   12,000 bytes and on x/huge with 20,000 (received in fragments)
 # - prints one "got <key> <payload> <attachment> <encoding> <stamped>" line
 #   per sample on x/pico/** and "done" after four (or the time limit)
 require "asterism/zenoh"
@@ -16,7 +17,7 @@ r = Z::Session.open(config: { "mode" => "router", "listen/endpoints" => ["tcp/12
                               "scouting/multicast/enabled" => false })
 c = Z::Session.open("tcp/127.0.0.1:#{port}")
 sub = c.subscribe("x/pico/**")
-qa = c.queryable("x/q")
+qa = c.queryable("x/*")
 puts "ready"
 $stdout.flush
 deadline = Time.now + 20
@@ -26,7 +27,13 @@ while Time.now < deadline && got < 4
     puts "got #{sm.key} #{sm.payload} #{sm.attachment.inspect} #{sm.encoding} #{!sm.timestamp.nil?}"
     got += 1
   end
-  qa.each_pending { |q| q.reply("x/q", "ans", encoding: "text/plain") }
+  qa.each_pending do |q|
+    case q.key
+    when "x/big" then q.reply("x/big", "b" * 12_000)
+    when "x/huge" then q.reply("x/huge", "h" * 20_000)
+    else q.reply("x/q", "ans", encoding: "text/plain")
+    end
+  end
   if got == 0
     c.put("x/cruby/a", "jpeg", encoding: "image/jpeg", attachment: "\x05")
     c.put("x/cruby/b", "plain")
