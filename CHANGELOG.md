@@ -6,6 +6,33 @@ Ruby API for what both have.
 
 ## Unreleased
 
+## 0.4.2
+
+The Ruby API of asterism-zenoh 0.4.2 (CRuby) for what both have, with the
+asterism gem 0.14.0 (wire protocol 2) on top. Additions only: every 0.4.1
+call works as before.
+
+- Encodings, declared publishers and received timestamps:
+  `Session#put(..., encoding:)` (the name zenoh prints, `"image/jpeg"`; nil
+  sends none), `Session#publisher(key, encoding:)` (`Publisher#put(payload,
+  attachment:, encoding:)`, `#close`, `#closed?`; the session undeclares
+  the ones left open when it closes). `Subscriber#each_sample` and
+  `Get#each_result` give `Sample` / `Reply` objects (key, payload,
+  attachment, kind, encoding, timestamp) from the same queue as
+  `each_pending` / `each_reply`, which keep their shape. A value without an
+  encoding reads as `"zenoh/bytes"`. `Timestamp` (`ntp64`, `id`,
+  `to_time`, comparable). Not on the boards, unlike CRuby: error replies in
+  `each_result`, priority and congestion members, keywords on `Sample.new`.
+- The encoding names come from the gem's own table in flash, not
+  zenoh-pico's (which pulled 212 bytes into internal RAM on ESP32).
+- Messages up to 16 KB in fragments: `Z_FRAG_MAX_SIZE` 16384 (zenoh-pico's
+  default 4096 dropped a reply of 4 KB or more, such as an application's
+  `@profile` with many declarations). No static RAM: the reassembly buffer
+  is allocated when the first fragment comes (from PSRAM on ESP-IDF) and
+  freed after; a build may still set its own `-DZ_FRAG_MAX_SIZE`.
+- `rake test_cruby`: a zenoh-c router and a CRuby client against the mruby
+  client (encodings, attachments, publishers, timestamps, a 12,000-byte
+  reply that arrives and a 20,000-byte one that is dropped).
 - TLS links on POSIX hosts, when the host build turns them on
   (`Z_FEATURE_LINK_TLS=1` for this gem and the include paths of an Mbed TLS
   3.x with TLS 1.3): the stream `ports/posix/zp_tls_posix.c`, the ESP-IDF
